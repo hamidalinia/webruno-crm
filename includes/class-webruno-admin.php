@@ -7,6 +7,8 @@ class Webruno_Admin {
         add_action('admin_menu', [__CLASS__, 'menu']);
         add_action('admin_init', [__CLASS__, 'register_settings']);
         add_action('admin_enqueue_scripts', [__CLASS__, 'assets']);
+        add_action('admin_notices', [__CLASS__, 'maybe_render_upgrade_notice']);
+        add_action('admin_init', [__CLASS__, 'handle_dismiss_upgrade_notice']);
     }
 
     public static function menu() {
@@ -32,7 +34,28 @@ class Webruno_Admin {
 
     public static function assets($hook) {
         if (strpos($hook, 'webruno-crm') === false) return;
+
         wp_enqueue_style('webruno-crm-admin', WEBRUNO_CRM_URL . 'assets/admin.css', [], WEBRUNO_CRM_VERSION);
+
+        wp_enqueue_script(
+            'webruno-crm-admin',
+            WEBRUNO_CRM_URL . 'assets/admin.js',
+            [],
+            WEBRUNO_CRM_VERSION,
+            true
+        );
+
+        wp_localize_script('webruno-crm-admin', 'webrunoCrmAjax', [
+            'ajaxUrl' => admin_url('admin-ajax.php'),
+            'nonce'   => wp_create_nonce('webruno_crm_ajax'),
+            'strings' => [
+                'connecting'        => __('Connecting…', 'webruno-crm'),
+                'disconnecting'     => __('Disconnecting…', 'webruno-crm'),
+                'genericError'      => __('Something went wrong. Please try again.', 'webruno-crm'),
+                'networkError'      => __('Could not reach the server. Check your connection and try again.', 'webruno-crm'),
+                'confirmDisconnect' => __('Disconnect this site from Webruno?', 'webruno-crm'),
+            ],
+        ]);
     }
 
     public static function register_settings() {
@@ -53,20 +76,13 @@ class Webruno_Admin {
     public static function render_main_page() {
         if (!current_user_can('manage_options')) return;
 
-        // phpcs:disable WordPress.Security.NonceVerification.Recommended -- read-only display flags, no state change; the state change itself is nonce-verified in Webruno_Auth::handle_callback()/disconnect().
-        $connected    = isset($_GET['connected']) ? sanitize_text_field(wp_unslash($_GET['connected'])) : '';
-        $disconnected = isset($_GET['disconnected']) ? sanitize_text_field(wp_unslash($_GET['disconnected'])) : '';
-        // phpcs:enable
-
-        if ($connected) {
-            echo '<div class="notice notice-success is-dismissible"><p>' . esc_html__('Connected to Webruno successfully.', 'webruno-crm') . '</p></div>';
-        }
-        if ($disconnected) {
-            echo '<div class="notice notice-info is-dismissible"><p>' . esc_html__('Disconnected from Webruno.', 'webruno-crm') . '</p></div>';
-        }
-
         echo '<div class="wrap webruno-crm-wrap">';
         echo '<h1>' . esc_html__('Webruno CRM', 'webruno-crm') . '</h1>';
+
+        // Live status region: JS fills this in on connect/disconnect/error.
+        // Starts hidden -- there is nothing to report until an action runs.
+        echo '<div id="webruno-crm-status" class="webruno-crm-status" hidden></div>';
+//        echo '<div class="webruno-crm-flex-box">';
 
         if (!Webruno_Auth::is_connected()) {
             self::render_connect_screen();
@@ -74,50 +90,37 @@ class Webruno_Admin {
             self::render_embedded_panel();
         }
 
+//        echo '</div>';
         echo '</div>';
     }
 
     private static function render_connect_screen() {
-        $connect_com_url = wp_nonce_url(
-            add_query_arg('domain', 'webruno.com', admin_url('admin-post.php?action=webruno_crm_connect')),
-            'webruno_crm_connect'
-        );
-        $connect_ir_url = wp_nonce_url(
-            add_query_arg('domain', 'webruno.ir', admin_url('admin-post.php?action=webruno_crm_connect')),
-            'webruno_crm_connect'
-        );
+        // Show what's already on the site BEFORE asking for a connection.
+        Webruno_Dashboard::render();
         ?>
         <div class="webruno-crm-connect-box" style="max-width:640px;padding:24px;background:#fff;border:1px solid #ccd0d4;border-radius:6px;">
-            <p><?php esc_html_e('Connect this site to your Webruno CRM account to manage leads, orders, and customers without leaving wp-admin.', 'webruno-crm'); ?></p>
+            <p><strong><?php esc_html_e('Connect to get this on autopilot:', 'webruno-crm'); ?></strong>
+                <?php esc_html_e('automatic follow-ups, repeat-buyer tags, and cold-lead reminders — without leaving wp-admin.', 'webruno-crm'); ?></p>
 
             <p>
-                <a href="<?php echo esc_url($connect_com_url); ?>" class="button button-primary">
-                    <?php esc_html_e('Connect via webruno.com', 'webruno-crm'); ?>
-                </a>
-                &nbsp;
-                <a href="<?php echo esc_url($connect_ir_url); ?>" class="button button-primary">
-                    <?php esc_html_e('Connect via webruno.ir', 'webruno-crm'); ?>
-                </a>
+                <button type="button" class="button button-primary button-hero webruno-crm-connect-btn" data-domain="webruno.com">
+                    <?php esc_html_e('Connect & Create Free Webruno Account', 'webruno-crm'); ?>
+                </button>
             </p>
+            <p class="description"><?php esc_html_e('Free to connect. No credit card required.', 'webruno-crm'); ?></p>
 
             <p style="margin-top:8px;">
-                <?php
-                printf(
-                    /* translators: %s: signup URL */
-                    esc_html__('Don\'t have a Webruno account yet? %s', 'webruno-crm'),
-                    '<a href="https://webruno.com/login" target="_blank" rel="noopener noreferrer">' . esc_html__('Sign up or log in', 'webruno-crm') . '</a>'
-                );
-                ?>
+                <?php esc_html_e('Prefer webruno.ir?', 'webruno-crm'); ?>
+                <button type="button" class="button-link webruno-crm-connect-btn" data-domain="webruno.ir">
+                    <?php esc_html_e('Connect via webruno.ir instead', 'webruno-crm'); ?>
+                </button>
             </p>
 
             <hr style="margin:20px 0;" />
 
             <details>
                 <summary style="cursor:pointer;font-weight:600;"><?php esc_html_e('Use a custom domain or enter your token manually', 'webruno-crm'); ?></summary>
-                <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-top:16px;">
-                    <input type="hidden" name="action" value="webruno_crm_manual_connect" />
-                    <?php wp_nonce_field('webruno_crm_manual_connect'); ?>
-
+                <form id="webruno-crm-manual-connect-form" style="margin-top:16px;">
                     <table class="form-table">
                         <tr>
                             <th scope="row"><label for="webruno_crm_domain"><?php esc_html_e('Domain', 'webruno-crm'); ?></label></th>
@@ -132,19 +135,21 @@ class Webruno_Admin {
                         <tr>
                             <th scope="row"><label for="webruno_crm_custom_domain"><?php esc_html_e('Custom domain URL', 'webruno-crm'); ?></label></th>
                             <td>
-                                <input type="url" name="webruno_crm_custom_domain" id="webruno_crm_custom_domain" class="regular-text" placeholder="https://crm.yourdomain.com" />
+                                <input type="url" id="webruno_crm_custom_domain" class="regular-text" placeholder="https://crm.yourdomain.com" />
                                 <p class="description"><?php esc_html_e('Only needed if you selected "Custom domain" above.', 'webruno-crm'); ?></p>
                             </td>
                         </tr>
                         <tr>
                             <th scope="row"><label for="webruno_crm_manual_token"><?php esc_html_e('API Token', 'webruno-crm'); ?></label></th>
                             <td>
-                                <input type="password" name="webruno_crm_manual_token" id="webruno_crm_manual_token" class="regular-text" autocomplete="off" />
+                                <input type="password" id="webruno_crm_manual_token" class="regular-text" autocomplete="off" />
                                 <p class="description"><?php esc_html_e('Find this under Settings > API in your Webruno account.', 'webruno-crm'); ?></p>
                             </td>
                         </tr>
                     </table>
-                    <?php submit_button(__('Save & Connect', 'webruno-crm')); ?>
+                    <p class="submit">
+                        <button type="submit" class="button button-primary"><?php esc_html_e('Save & Connect', 'webruno-crm'); ?></button>
+                    </p>
                 </form>
             </details>
         </div>
@@ -152,75 +157,43 @@ class Webruno_Admin {
     }
 
     private static function render_embedded_panel() {
-        $disconnect_url = wp_nonce_url(
-            admin_url('admin-post.php?action=webruno_crm_disconnect'),
-            'webruno_crm_disconnect'
-        );
-        $site_id  = get_option('webruno_crm_site_id');
-        $panel_url = add_query_arg('site_id', rawurlencode($site_id), Webruno_Auth::get_api_base() . '/panel');
-        $stats = self::fetch_stats();
         ?>
         <p>
-            <a href="<?php echo esc_url($disconnect_url); ?>" class="button" onclick="return confirm('<?php echo esc_js(__('Disconnect this site from Webruno?', 'webruno-crm')); ?>');">
+            <button type="button" class="button webruno-crm-disconnect-btn">
                 <?php esc_html_e('Disconnect', 'webruno-crm'); ?>
-            </a>
-            <a href="<?php echo esc_url($panel_url); ?>" class="button button-primary" target="_blank" rel="noopener noreferrer">
+            </button>
+            <a href="<?php echo esc_url(self::panel_url()); ?>" class="button button-primary" target="_blank" rel="noopener noreferrer">
                 <?php esc_html_e('Open full CRM on Webruno', 'webruno-crm'); ?> ↗
             </a>
         </p>
 
-        <div class="webruno-crm-stats" style="display:flex;gap:16px;margin:20px 0;flex-wrap:wrap;">
-            <?php foreach (self::stat_cards($stats) as $card) : ?>
-                <div style="flex:1;min-width:160px;padding:18px;background:#fff;border:1px solid #ccd0d4;border-radius:6px;">
-                    <div style="font-size:26px;font-weight:600;"><?php echo esc_html($card['value']); ?></div>
-                    <div style="color:#646970;"><?php echo esc_html($card['label']); ?></div>
-                </div>
-            <?php endforeach; ?>
-        </div>
+        <?php
+        // Full local dashboard: real numbers computed from this site's own
+        // data (orders, revenue, repeat/stale customers, leads, new users)
+        // plus the rule-based recommendations. Same renderer used pre-connect,
+        // so numbers never regress to "—" placeholders once connected.
+        Webruno_Dashboard::render();
+        ?>
 
-        <div style="padding:20px;background:#fff;border:1px solid #ccd0d4;border-radius:6px;">
+        <div style="padding:20px;background:#fff;border:1px solid #ccd0d4;border-radius:6px;margin-top:20px;">
             <h2 style="margin-top:0;"><?php esc_html_e('Want more from this data?', 'webruno-crm'); ?></h2>
             <p><?php esc_html_e('Webruno CRM Pro gives you a full pipeline view, call scripts, automation, and reporting — right alongside the leads and orders this plugin already sends over.', 'webruno-crm'); ?></p>
-            <a href="https://webruno.com/pricing" class="button button-primary" target="_blank" rel="noopener noreferrer">
+            <a href="https://webruno.com/crm-pricing" class="button button-primary" target="_blank" rel="noopener noreferrer">
                 <?php esc_html_e('See Webruno CRM Pro', 'webruno-crm'); ?> ↗
             </a>
         </div>
         <?php
     }
 
-    /** Pull a small summary from Webruno's API to show natively (no iframe). Fails quietly if unreachable. */
-    private static function fetch_stats() {
+    private static function panel_url() {
         $token = Webruno_Auth::get_token();
-        if (!$token) return [];
 
-        $cached = get_transient('webruno_crm_stats');
-        if ($cached !== false) return $cached;
-
-        $response = wp_remote_get(Webruno_Auth::get_api_base() . '/api/site/stats', [
-            'headers' => [
-                'Authorization' => 'Bearer ' . $token,
-                'X-Site-Id'     => get_option('webruno_crm_site_id'),
-            ],
-            'timeout' => 8,
-        ]);
-
-        if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
-            return [];
+        if (!$token) {
+            // Not connected (or token missing) — nothing sensible to link to.
+            return Webruno_Auth::get_api_base();
         }
 
-        $data = json_decode(wp_remote_retrieve_body($response), true);
-        $data = is_array($data) ? $data : [];
-        set_transient('webruno_crm_stats', $data, 5 * MINUTE_IN_SECONDS);
-
-        return $data;
-    }
-
-    private static function stat_cards($stats) {
-        return [
-            ['label' => __('Leads', 'webruno-crm'),  'value' => $stats['leads']  ?? '—'],
-            ['label' => __('Orders', 'webruno-crm'), 'value' => $stats['orders'] ?? '—'],
-            ['label' => __('Posts synced', 'webruno-crm'), 'value' => $stats['posts'] ?? '—'],
-        ];
+        return add_query_arg('token', rawurlencode($token), Webruno_Auth::get_api_base() . '/profile');
     }
 
     public static function render_settings_page() {
@@ -273,5 +246,48 @@ class Webruno_Admin {
             </form>
         </div>
         <?php
+    }
+
+    /**
+     * Optional, dismissible admin notice pointing at Pro -- shown only on
+     * Webruno CRM's own screens, only when there's a real, specific reason
+     * (at least one stale or repeat customer), and only after the user has
+     * connected. Informational, not a blocker: never appears on other
+     * wp-admin screens, never disables plugin functionality, and dismissing
+     * it persists per-user.
+     */
+    public static function maybe_render_upgrade_notice() {
+        $screen = function_exists('get_current_screen') ? get_current_screen() : null;
+        if (!$screen || strpos($screen->id, 'webruno-crm') === false) return;
+        if (!current_user_can('manage_options')) return;
+        if (!class_exists('Webruno_Auth') || !Webruno_Auth::is_connected()) return;
+        if (get_user_meta(get_current_user_id(), 'webruno_crm_dismissed_upgrade_notice', true)) return;
+        if (!class_exists('Webruno_Dashboard') || !class_exists('WooCommerce')) return;
+        if (!method_exists('Webruno_Dashboard', 'get_upgrade_signal')) return;
+
+        $signal = Webruno_Dashboard::get_upgrade_signal();
+        if (!$signal) return;
+
+        $dismiss_url = wp_nonce_url(
+            add_query_arg('webruno_crm_dismiss_upgrade_notice', '1'),
+            'webruno_crm_dismiss_upgrade_notice'
+        );
+        ?>
+        <div class="notice notice-info is-dismissible webruno-crm-upgrade-notice">
+            <p>
+                <strong><?php esc_html_e('Webruno CRM:', 'webruno-crm'); ?></strong>
+                <?php echo esc_html($signal); ?>
+                <a href="https://webruno.com/crm-pricing" target="_blank" rel="noopener noreferrer"><?php esc_html_e('See CRM Pro', 'webruno-crm'); ?></a>
+            </p>
+        </div>
+        <?php
+    }
+
+    /** Handles the dismiss-upgrade-notice link so it stays dismissed for this admin user. */
+    public static function handle_dismiss_upgrade_notice() {
+        if (!isset($_GET['webruno_crm_dismiss_upgrade_notice'])) return;
+        if (!current_user_can('manage_options')) return;
+        check_admin_referer('webruno_crm_dismiss_upgrade_notice');
+        update_user_meta(get_current_user_id(), 'webruno_crm_dismissed_upgrade_notice', 1);
     }
 }

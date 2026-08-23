@@ -3,7 +3,7 @@
  * Plugin Name: Webruno CRM
  * Plugin URI: https://webruno.com
  * Description: Connect your site to Webruno CRM — sync orders, leads, posts, and users, and manage your CRM panel right inside wp-admin.
- * Version: 1.0.2
+ * Version: 1.0.4
  * Author: Hamid Alinia - idehweb
  * Author URI: https://idehweb.com
  * Text Domain: webruno-crm
@@ -15,12 +15,14 @@
 
 if (!defined('ABSPATH')) exit;
 
-define('WEBRUNO_CRM_VERSION', '1.0.2');
+define('WEBRUNO_CRM_VERSION', '1.0.4');
 define('WEBRUNO_CRM_DIR', plugin_dir_path(__FILE__));
 define('WEBRUNO_CRM_URL', plugin_dir_url(__FILE__));
 define('WEBRUNO_CRM_DEFAULT_DOMAIN', 'webruno.com'); // fallback if nothing is configured yet
 
 require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-auth.php';
+require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-dashboard.php';
+require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-customer-meta.php';
 require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-admin.php';
 require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-sync.php';
 require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-bulk-sync.php';
@@ -29,6 +31,7 @@ require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-webhook.php';
 add_action('plugins_loaded', 'webruno_crm_init');
 function webruno_crm_init() {
     Webruno_Auth::init();
+    Webruno_Customer_Meta::init();
     Webruno_Admin::init();
     Webruno_Sync::init();
     Webruno_Bulk_Sync::init();

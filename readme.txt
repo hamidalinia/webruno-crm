@@ -2,9 +2,9 @@
 Contributors: glboy
 Tags: crm, leads, sync, woocommerce, contact form 7
 Requires at least: 5.8
-Tested up to: 7.0
+Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 1.0.2
+Stable tag: 1.0.4
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -51,6 +51,11 @@ This plugin connects to your chosen Webruno domain (webruno.com, webruno.ir, or 
 * Service: Webruno (webruno.com / webruno.ir), operated by Idehweb. Terms of Service: https://webruno.com/terms — Privacy Policy: https://webruno.com/privacy
 
 == Changelog ==
+
+= 1.0.4 =
+* Free-tier CRM dashboard: revenue chart, customer table, top products, VIP tagging, notes, and one-click customer emails
+* Fixed WordPress.org plugin check errors: missing translator comments, unescaped output, unprepared SQL, direct filesystem calls
+* Bumped tested-up-to and synced version numbers
 
 = 1.0.2 =
 * Enqueue bulk sync JS properly instead of inline script tag

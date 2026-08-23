@@ -4,19 +4,38 @@ if (!defined('ABSPATH')) exit;
 /**
  * Handles the connect/disconnect handshake between this site and Webruno.
  *
- * Flow:
- * 1. Admin clicks "Connect to Webruno" -> we build a signed redirect URL to webruno.com
- * 2. User approves on webruno.com -> webruno redirects back to admin-post.php?action=webruno_crm_callback&token=...
- * 3. We store the token (encrypted-at-rest via WP options + a site-specific secret) and mark as connected
+ * AJAX flow (replaces the old admin-post.php redirect flow):
+ * 1. Admin clicks "Connect" in wp-admin -> JS POSTs to wp_ajax_webruno_crm_connect
+ * 2. This handler talks to webruno.com/webruno.ir server-to-server (customer
+ *    create + site verify), and returns JSON success/failure immediately --
+ *    no redirect, no waiting on a callback that may never come.
+ * 3. On success we store the token (encrypted-at-rest via WP options + a
+ *    site-specific secret) and the JS updates the page in place.
  */
 class Webruno_Auth {
 
     public static function init() {
-        add_action('admin_post_webruno_crm_connect', [__CLASS__, 'start_connect']);
-        add_action('admin_post_webruno_crm_callback', [__CLASS__, 'handle_callback']);
-        add_action('admin_post_webruno_crm_disconnect', [__CLASS__, 'disconnect']);
-        add_action('admin_post_webruno_crm_manual_connect', [__CLASS__, 'manual_connect']);
+        add_action('wp_ajax_webruno_crm_connect', [__CLASS__, 'ajax_connect']);
+        add_action('wp_ajax_webruno_crm_manual_connect', [__CLASS__, 'ajax_manual_connect']);
+        add_action('wp_ajax_webruno_crm_disconnect', [__CLASS__, 'ajax_disconnect']);
         add_filter('allowed_redirect_hosts', [__CLASS__, 'allow_webruno_host']);
+        add_action('rest_api_init', [__CLASS__, 'register_verify_route']);
+    }
+
+    /**
+     * Public, read-only route the Webruno backend calls back to confirm
+     * this site really controls the site_id it claims -- see
+     * verifyAndCreatePluginWebsite on the backend. Only ever echoes back
+     * the site's own locally-generated site_id, nothing sensitive.
+     */
+    public static function register_verify_route() {
+        register_rest_route('webruno-crm/v1', '/verify', [
+            'methods'             => 'GET',
+            'permission_callback' => '__return_true',
+            'callback'            => function () {
+                return ['site_id' => get_option('webruno_crm_site_id')];
+            },
+        ]);
     }
 
     /** Resolve which domain to talk to: webruno.com, webruno.ir, or a custom self-hosted URL. */
@@ -29,15 +48,14 @@ class Webruno_Auth {
         }
 
         if ($choice === 'webruno.ir') {
-            return 'https://webruno.ir';
+            return 'https://panel.webruno.ir';
         }
 
-        return 'https://webruno.com';
+        return 'https://panel.webruno.com';
     }
 
     public static function allow_webruno_host($hosts) {
         $hosts[] = wp_parse_url(self::get_api_base(), PHP_URL_HOST);
-        // Also allow-list both known first-party domains regardless of current selection.
         $hosts[] = 'webruno.com';
         $hosts[] = 'webruno.ir';
         return $hosts;
@@ -53,96 +71,182 @@ class Webruno_Auth {
         return self::decrypt($encrypted);
     }
 
-    public static function start_connect() {
-        if (!current_user_can('manage_options')) {
-            wp_die(esc_html__('Insufficient permissions.', 'webruno-crm'), 403);
-        }
-        check_admin_referer('webruno_crm_connect');
+    /**
+     * AJAX: one-click connect. Does the full customer-create + site-verify
+     * handshake server-to-server and reports back as JSON immediately, so
+     * the admin sees a live result instead of a silent click.
+     */
+    public static function ajax_connect() {
+        check_ajax_referer('webruno_crm_ajax', 'nonce');
 
-        $domain = isset($_GET['domain']) ? sanitize_text_field(wp_unslash($_GET['domain'])) : 'webruno.com';
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => __('Insufficient permissions.', 'webruno-crm')], 403);
+        }
+
+        $domain = isset($_POST['domain']) ? sanitize_text_field(wp_unslash($_POST['domain'])) : 'webruno.com';
         if (!in_array($domain, ['webruno.com', 'webruno.ir'], true)) {
             $domain = 'webruno.com';
         }
         update_option('webruno_crm_domain', $domain);
 
-        $site_id  = get_option('webruno_crm_site_id');
-        $site_url = home_url('/');
-        $return   = admin_url('admin-post.php?action=webruno_crm_callback');
+        $result = self::perform_connect();
 
-        $connect_url = add_query_arg([
-            'site_id'      => $site_id,
-            'site_url'     => rawurlencode($site_url),
-            'site_name'    => rawurlencode(get_bloginfo('name')),
-            'return_url'   => rawurlencode($return),
-            'state'        => wp_create_nonce('webruno_crm_state'),
-        ], self::get_api_base() . '/login');
+        if (is_wp_error($result)) {
+            wp_send_json_error(['message' => $result->get_error_message()]);
+        }
 
-        wp_safe_redirect(esc_url_raw($connect_url));
-        exit;
+        wp_send_json_success([
+            'message'      => __('Connected to Webruno successfully.', 'webruno-crm'),
+            'connected_at' => get_option('webruno_crm_connected_at'),
+        ]);
     }
 
-    public static function handle_callback() {
+    /** AJAX: manual/custom-domain connect using a pasted token. */
+    public static function ajax_manual_connect() {
+        check_ajax_referer('webruno_crm_ajax', 'nonce');
+
         if (!current_user_can('manage_options')) {
-            wp_die(esc_html__('Insufficient permissions.', 'webruno-crm'), 403);
+            wp_send_json_error(['message' => __('Insufficient permissions.', 'webruno-crm')], 403);
         }
 
-        $state = isset($_GET['state']) ? sanitize_text_field(wp_unslash($_GET['state'])) : '';
-        if (!wp_verify_nonce($state, 'webruno_crm_state')) {
-            wp_die(esc_html__('Invalid or expired connection request. Please try connecting again.', 'webruno-crm'));
-        }
-
-        $token = isset($_GET['token']) ? sanitize_text_field(wp_unslash($_GET['token'])) : '';
-        if (empty($token)) {
-            wp_die(esc_html__('Webruno did not return a valid token.', 'webruno-crm'));
-        }
-
-        update_option('webruno_crm_api_token', self::encrypt($token), false);
-        update_option('webruno_crm_connected_at', current_time('mysql'), false);
-
-        wp_safe_redirect(admin_url('admin.php?page=webruno-crm&connected=1'));
-        exit;
-    }
-
-    public static function disconnect() {
-        if (!current_user_can('manage_options')) {
-            wp_die(esc_html__('Insufficient permissions.', 'webruno-crm'), 403);
-        }
-        check_admin_referer('webruno_crm_disconnect');
-
-        delete_option('webruno_crm_api_token');
-        delete_option('webruno_crm_connected_at');
-
-        wp_safe_redirect(admin_url('admin.php?page=webruno-crm&disconnected=1'));
-        exit;
-    }
-
-    public static function manual_connect() {
-        if (!current_user_can('manage_options')) {
-            wp_die(esc_html__('Insufficient permissions.', 'webruno-crm'), 403);
-        }
-        check_admin_referer('webruno_crm_manual_connect');
-
-        $domain = isset($_POST['webruno_crm_domain']) ? sanitize_text_field(wp_unslash($_POST['webruno_crm_domain'])) : 'webruno.com';
+        $domain = isset($_POST['domain']) ? sanitize_text_field(wp_unslash($_POST['domain'])) : 'webruno.com';
         if (!in_array($domain, ['webruno.com', 'webruno.ir', 'custom'], true)) {
             $domain = 'webruno.com';
         }
         update_option('webruno_crm_domain', $domain);
 
         if ($domain === 'custom') {
-            $custom = isset($_POST['webruno_crm_custom_domain']) ? esc_url_raw(wp_unslash($_POST['webruno_crm_custom_domain'])) : '';
+            $custom = isset($_POST['custom_domain']) ? esc_url_raw(wp_unslash($_POST['custom_domain'])) : '';
+            if (!$custom) {
+                wp_send_json_error(['message' => __('Please enter a custom domain URL.', 'webruno-crm')]);
+            }
             update_option('webruno_crm_custom_domain', $custom);
         }
 
-        $token = isset($_POST['webruno_crm_manual_token']) ? sanitize_text_field(wp_unslash($_POST['webruno_crm_manual_token'])) : '';
+        $token = isset($_POST['token']) ? sanitize_text_field(wp_unslash($_POST['token'])) : '';
         if (empty($token)) {
-            wp_die(esc_html__('Please enter a valid API token.', 'webruno-crm'));
+            wp_send_json_error(['message' => __('Please enter a valid API token.', 'webruno-crm')]);
         }
 
         update_option('webruno_crm_api_token', self::encrypt($token), false);
         update_option('webruno_crm_connected_at', current_time('mysql'), false);
 
-        wp_safe_redirect(admin_url('admin.php?page=webruno-crm&connected=1'));
-        exit;
+        wp_send_json_success([
+            'message'      => __('Connected to Webruno successfully.', 'webruno-crm'),
+            'connected_at' => get_option('webruno_crm_connected_at'),
+        ]);
+    }
+
+    /** AJAX: disconnect. */
+    public static function ajax_disconnect() {
+        check_ajax_referer('webruno_crm_ajax', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => __('Insufficient permissions.', 'webruno-crm')], 403);
+        }
+
+        delete_option('webruno_crm_api_token');
+        delete_option('webruno_crm_connected_at');
+
+        wp_send_json_success(['message' => __('Disconnected from Webruno.', 'webruno-crm')]);
+    }
+
+    /**
+     * Does the actual two-step handshake with the Webruno backend:
+     * 1) create/reuse Customer -> token
+     * 2) verify site ownership + create Website record, authenticated with that token
+     * Returns true on success, or a WP_Error with a human-readable message.
+     */
+    private static function perform_connect() {
+        $site_id     = get_option('webruno_crm_site_id');
+        $site_url    = home_url('/');
+        $admin_user  = wp_get_current_user();
+        $admin_email = ($admin_user && $admin_user->user_email) ? $admin_user->user_email : get_bloginfo('admin_email');
+
+        $connect_resp = wp_remote_post(self::get_api_base() . '/customer/customer/webruno-plugin-connect', [
+            'headers' => ['Content-Type' => 'application/json'],
+            'body'    => wp_json_encode([
+                'siteUrl'    => $site_url,
+                'adminEmail' => $admin_email,
+                'siteId'     => $site_id,
+            ]),
+            'timeout' => 15,
+        ]);
+//        $connect_body = json_decode(wp_remote_retrieve_body($connect_resp), true);
+//print_r($connect_body);
+//die();
+
+        if (is_wp_error($connect_resp)) {
+            return new WP_Error(
+                'webruno_connect_unreachable',
+                sprintf(
+                /* translators: %s: error message */
+                    __('Could not reach Webruno: %s', 'webruno-crm'),
+                    $connect_resp->get_error_message()
+                )
+            );
+        }
+
+        $status = wp_remote_retrieve_response_code($connect_resp);
+        $connect_body = json_decode(wp_remote_retrieve_body($connect_resp), true);
+
+        if ($status < 200 || $status >= 300 || empty($connect_body['success']) || empty($connect_body['token'])) {
+            return new WP_Error(
+                'webruno_connect_failed',
+                !empty($connect_body['message'])
+                    ? $connect_body['message']
+                    /* translators: %d: HTTP status code */
+                    : sprintf(__('Connection failed (HTTP %d).', 'webruno-crm'), $status)
+            );
+        }
+
+        $token = $connect_body['token'];
+
+        $verify_resp = wp_remote_post(self::get_api_base() . '/customer/customer/webruno-plugin-verify', [
+            'headers' => [
+                'Content-Type' => 'application/json',
+                '_id'          => $connect_body['customerId'],
+                'token'        => $token,
+            ],
+            'body'    => wp_json_encode([
+                'customerId' => $connect_body['customerId'],
+                'siteUrl'    => $site_url,
+                'siteId'     => $site_id,
+                'siteTitle'  => get_bloginfo('name'),
+            ]),
+            'timeout' => 15,
+        ]);
+
+
+        if (is_wp_error($verify_resp)) {
+            return new WP_Error(
+                'webruno_verify_unreachable',
+                sprintf(
+                    /* translators: %s: underlying error message from the failed HTTP request */
+                    __('Could not verify this site with Webruno: %s', 'webruno-crm'),
+                    $verify_resp->get_error_message()
+                )
+            );
+        }
+
+        $verify_status = wp_remote_retrieve_response_code($verify_resp);
+        $verify_body   = json_decode(wp_remote_retrieve_body($verify_resp), true);
+
+        if ($verify_status < 200 || $verify_status >= 300 || empty($verify_body['success'])) {
+            return new WP_Error(
+                'webruno_verify_failed',
+                !empty($verify_body['message'])
+                    ? $verify_body['message']
+                    /* translators: %d: HTTP status code */
+                    : sprintf(__('Site verification failed (HTTP %d).', 'webruno-crm'), $verify_status)
+            );
+        }
+
+        update_option('webruno_crm_api_token', self::encrypt($token), false);
+        update_option('webruno_crm_customer_id', sanitize_text_field($connect_body['customerId']), false);
+        update_option('webruno_crm_connected_at', current_time('mysql'), false);
+
+        return true;
     }
 
     /** Simple reversible encryption using a per-site key derived from wp_salt(). Not for high-security secrets, but avoids plaintext-in-DB storage. */
