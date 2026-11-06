@@ -47,9 +47,17 @@ class Webruno_Admin {
 
         wp_localize_script('webruno-crm-admin', 'webrunoCrmAjax', [
             'ajaxUrl' => admin_url('admin-ajax.php'),
+            'pollIntervalMs' => 3000,
+            'pollTimeoutMs'  => 600000,
             'nonce'   => wp_create_nonce('webruno_crm_ajax'),
             'strings' => [
                 'connecting'        => __('Connecting…', 'webruno-crm'),
+                'waiting'           => __('Waiting for your approval on Webruno… Sign in there and approve this site.', 'webruno-crm'),
+                'openLink'          => __('Open the Webruno approval page', 'webruno-crm'),
+                'cancel'            => __('Cancel', 'webruno-crm'),
+                'timedOut'          => __('Timed out waiting for approval. Please try again.', 'webruno-crm'),
+                'declined'          => __('The connection was declined on Webruno.', 'webruno-crm'),
+                'cancelled'         => __('Connection cancelled.', 'webruno-crm'),
                 'disconnecting'     => __('Disconnecting…', 'webruno-crm'),
                 'genericError'      => __('Something went wrong. Please try again.', 'webruno-crm'),
                 'networkError'      => __('Could not reach the server. Check your connection and try again.', 'webruno-crm'),
@@ -107,7 +115,7 @@ class Webruno_Admin {
                     <?php esc_html_e('Connect & Create Free Webruno Account', 'webruno-crm'); ?>
                 </button>
             </p>
-            <p class="description"><?php esc_html_e('Free to connect. No credit card required.', 'webruno-crm'); ?></p>
+            <p class="description"><?php esc_html_e('Free to connect. No credit card required. A Webruno page opens in a new tab where you sign in (or sign up) and approve this site.', 'webruno-crm'); ?></p>
 
             <p style="margin-top:8px;">
                 <?php esc_html_e('Prefer webruno.ir?', 'webruno-crm'); ?>
@@ -128,7 +136,7 @@ class Webruno_Admin {
                                 <select name="webruno_crm_domain" id="webruno_crm_domain">
                                     <option value="webruno.com"><?php esc_html_e('webruno.com', 'webruno-crm'); ?></option>
                                     <option value="webruno.ir"><?php esc_html_e('webruno.ir', 'webruno-crm'); ?></option>
-                                    <option value="custom"><?php esc_html_e('Custom domain', 'webruno-crm'); ?></option>
+                                    <option value="custom"><?php esc_html_e('Custom domain (https only)', 'webruno-crm'); ?></option>
                                 </select>
                             </td>
                         </tr>
@@ -186,14 +194,9 @@ class Webruno_Admin {
     }
 
     private static function panel_url() {
-        $token = Webruno_Auth::get_token();
-
-        if (!$token) {
-            // Not connected (or token missing) — nothing sensible to link to.
-            return Webruno_Auth::get_api_base();
-        }
-
-        return add_query_arg('token', rawurlencode($token), Webruno_Auth::get_api_base() . '/profile');
+        // Never put the API token in a URL (it would end up in browser history, server logs and referrers).
+        // The admin signs in to Webruno with their own account in the browser.
+        return Webruno_Auth::get_api_base();
     }
 
     public static function render_settings_page() {
