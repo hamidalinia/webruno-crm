@@ -23,6 +23,15 @@ delete_option('webruno_crm_content_write');
 delete_option('webruno_crm_content_db_ver');
 delete_option('webruno_crm_content_last_reject');
 wp_clear_scheduled_hook('webruno_crm_prune_content_tables');
+
+// Data kept by the CRM dashboard and by AI edits (snapshots), temporary values and per-user notice flags.
+delete_option('webruno_crm_customer_meta');
+delete_option('webruno_crm_menu_snapshots');
+delete_option('webruno_crm_product_snapshots');
+delete_transient('webruno_crm_challenge');
+delete_transient('webruno_crm_leads_30d');
+delete_transient('webruno_crm_new_users_30d');
+delete_metadata('user', 0, 'webruno_crm_dismissed_upgrade_notice', '', true);
 global $wpdb;
 $webruno_tables = [$wpdb->prefix . 'webruno_nonces', $wpdb->prefix . 'webruno_audit'];
 foreach ($webruno_tables as $webruno_table) {
