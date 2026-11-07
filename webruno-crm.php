@@ -28,6 +28,7 @@ require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-admin.php';
 require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-sync.php';
 require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-bulk-sync.php';
 require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-webhook.php';
+require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-content-api.php';
 
 add_action('plugins_loaded', 'webruno_crm_init');
 function webruno_crm_init() {
@@ -37,7 +38,12 @@ function webruno_crm_init() {
     Webruno_Sync::init();
     Webruno_Bulk_Sync::init();
     Webruno_Webhook::init();
+    Webruno_Content_API::init();
 }
+
+register_deactivation_hook(__FILE__, function () {
+    wp_clear_scheduled_hook('webruno_crm_prune_content_tables');
+});
 
 // Clean, standard activation/deactivation — no artificial feature gating.
 register_activation_hook(__FILE__, function () {
