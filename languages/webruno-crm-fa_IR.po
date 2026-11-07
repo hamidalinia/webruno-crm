@@ -1,0 +1,56 @@
+# Persian (fa_IR) translation of the strings added for region detection (F3).
+# Other plugin strings are not included here. Compile with msgfmt to .mo to use it; wordpress.org translations load automatically.
+msgid ""
+msgstr ""
+"Project-Id-Version: Webruno CRM\n"
+"Language: fa_IR\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n > 1);\n"
+
+msgid "Webruno server for this site:"
+msgstr "سرور وردرانو برای این سایت:"
+
+msgid "Change manually:"
+msgstr "تغییر دستی:"
+
+msgid "Iran (webruno.ir)"
+msgstr "ایران (webruno.ir)"
+
+msgid "International (webruno.com)"
+msgstr "بین‌المللی (webruno.com)"
+
+msgid "Detect automatically"
+msgstr "تشخیص خودکار"
+
+msgid "Checking which Webruno server fits this site…"
+msgstr "در حال بررسی اینکه کدام سرور وردرانو برای این سایت مناسب است…"
+
+msgid "Unknown Webruno server."
+msgstr "سرور وردرانو نامعتبر است."
+
+msgid "You chose this server manually."
+msgstr "این سرور را خودتان انتخاب کرده‌اید."
+
+msgid "The site language is Persian."
+msgstr "زبان سایت فارسی است."
+
+msgid "The site language is not Persian."
+msgstr "زبان سایت فارسی نیست."
+
+msgid "This server is located in Iran."
+msgstr "این سرور در ایران قرار دارد."
+
+msgid "This server is located outside Iran."
+msgstr "این سرور خارج از ایران قرار دارد."
+
+msgid "The server location could not be checked."
+msgstr "محل سرور بررسی نشد."
+
+msgid "Webruno could not be reached to check where this server is located, so only the site language was used (not Persian, so the international server was chosen). If this site is hosted in Iran or serves Iranian customers, use \"Change manually\" to pick webruno.ir."
+msgstr "برای بررسی محل این سرور به وردرانو دسترسی پیدا نشد؛ بنابراین فقط زبان سایت در نظر گرفته شد (فارسی نبود، پس سرور بین‌المللی انتخاب شد). اگر این سایت در ایران میزبانی می‌شود یا مشتریان ایرانی دارد، از «تغییر دستی» webruno.ir را انتخاب کنید."
+
+#. translators: 1: Webruno server host, 2: error message
+msgid "Could not reach %1$s: %2$s. Webruno does not switch to another server on its own; you can change the server manually and try again."
+msgstr "اتصال به %1$s برقرار نشد: %2$s. وردرانو به‌صورت خودکار به سرور دیگری سوئیچ نمی‌کند؛ می‌توانید سرور را دستی تغییر دهید و دوباره تلاش کنید."

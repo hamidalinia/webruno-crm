@@ -26,6 +26,8 @@ class Webruno_Auth {
         add_action('wp_ajax_webruno_crm_connect', [__CLASS__, 'ajax_connect']);
         add_action('wp_ajax_webruno_crm_connect_poll', [__CLASS__, 'ajax_connect_poll']);
         add_action('wp_ajax_webruno_crm_connect_cancel', [__CLASS__, 'ajax_connect_cancel']);
+        add_action('wp_ajax_webruno_crm_region_detect', [__CLASS__, 'ajax_region_detect']);
+        add_action('wp_ajax_webruno_crm_region_set', [__CLASS__, 'ajax_region_set']);
         add_action('wp_ajax_webruno_crm_manual_connect', [__CLASS__, 'ajax_manual_connect']);
         add_action('wp_ajax_webruno_crm_disconnect', [__CLASS__, 'ajax_disconnect']);
         add_filter('allowed_redirect_hosts', [__CLASS__, 'allow_webruno_host']);
@@ -60,9 +62,9 @@ class Webruno_Auth {
         return ['challenge' => $stored['challenge']];
     }
 
-    /** Resolve which domain to talk to: webruno.com, webruno.ir, or a custom self-hosted https URL. */
+    /** Resolve which server to talk to: panel.webruno.ir, panel.webruno.com (by region), or a custom self-hosted https URL. */
     public static function get_api_base() {
-        $choice = get_option('webruno_crm_domain', 'webruno.com');
+        $choice = get_option('webruno_crm_domain', 'auto');
 
         if ($choice === 'custom') {
             $custom = self::sanitize_custom_domain(get_option('webruno_crm_custom_domain', ''));
@@ -70,10 +72,16 @@ class Webruno_Auth {
         }
 
         if ($choice === 'webruno.ir') {
-            return 'https://panel.webruno.ir';
+            return Webruno_Region::BASE_IR;
         }
 
-        return 'https://panel.webruno.com';
+        if ($choice === 'webruno.com') {
+            return Webruno_Region::BASE_COM;
+        }
+
+        // nothing chosen yet: the saved region decision (no network here; this runs on every request)
+        $state = Webruno_Region::get_state();
+        return $state['base'];
     }
 
     /** Custom domains must be https. Returns the cleaned URL or '' when it is not acceptable. */
@@ -118,9 +126,18 @@ class Webruno_Auth {
     public static function ajax_connect() {
         self::guard();
 
-        $domain = isset($_POST['domain']) ? sanitize_text_field(wp_unslash($_POST['domain'])) : 'webruno.com';
-        if (!in_array($domain, ['webruno.com', 'webruno.ir'], true)) {
-            $domain = 'webruno.com';
+        // Only the two Webruno servers, or a saved custom domain (https only). No domain sent = use the region decision.
+        $domain = isset($_POST['domain']) ? sanitize_text_field(wp_unslash($_POST['domain'])) : '';
+        if ($domain === '') {
+            $region_state = Webruno_Region::get_state();
+            $domain       = $region_state['domain'];
+        }
+        if ($domain === 'custom') {
+            if (!self::sanitize_custom_domain(get_option('webruno_crm_custom_domain', ''))) {
+                wp_send_json_error(['message' => __('Please enter a custom domain URL that starts with https://', 'webruno-crm')]);
+            }
+        } elseif (!in_array($domain, ['webruno.com', 'webruno.ir'], true)) {
+            wp_send_json_error(['message' => __('Unknown Webruno server.', 'webruno-crm')]);
         }
         update_option('webruno_crm_domain', $domain);
 
@@ -205,6 +222,37 @@ class Webruno_Auth {
         wp_send_json_success(['status' => 'pending']);
     }
 
+    /** Shape of a region state for the browser. */
+    public static function region_payload($state) {
+        return [
+            'region'  => $state['region'],
+            'domain'  => $state['domain'],
+            'host'    => (string) wp_parse_url($state['base'], PHP_URL_HOST),
+            'manual'  => $state['manual'],
+            'reasons' => Webruno_Region::describe_reasons($state['reasons']),
+            'message' => $state['message'],
+        ];
+    }
+
+    /** AJAX: detect the region now (network allowed) and save it. */
+    public static function ajax_region_detect() {
+        self::guard();
+        wp_send_json_success(self::region_payload(Webruno_Region::refresh()));
+    }
+
+    /** AJAX: manual choice: ir | intl | auto. */
+    public static function ajax_region_set() {
+        self::guard();
+        $choice = isset($_POST['region']) ? sanitize_text_field(wp_unslash($_POST['region'])) : '';
+        if (!in_array($choice, ['ir', 'intl', 'auto'], true)) {
+            wp_send_json_error(['message' => __('Unknown Webruno server.', 'webruno-crm')]);
+        }
+        $state = Webruno_Region::set_manual($choice);
+        // an explicit server choice replaces the old connect domain, so the next connect uses it
+        update_option('webruno_crm_domain', $state['domain']);
+        wp_send_json_success(self::region_payload($state));
+    }
+
     /** AJAX: the admin cancelled while waiting. Closing the request also stops /verify from answering. */
     public static function ajax_connect_cancel() {
         self::guard();
@@ -285,8 +333,9 @@ class Webruno_Auth {
             return new WP_Error(
                 'webruno_connect_unreachable',
                 sprintf(
-                    /* translators: %s: error message */
-                    __('Could not reach Webruno: %s', 'webruno-crm'),
+                    /* translators: 1: Webruno server host, 2: error message */
+                    __('Could not reach %1$s: %2$s. Webruno does not switch to another server on its own; you can change the server manually and try again.', 'webruno-crm'),
+                    (string) wp_parse_url($base, PHP_URL_HOST),
                     $resp->get_error_message()
                 )
             );
