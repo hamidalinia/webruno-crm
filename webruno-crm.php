@@ -7,7 +7,7 @@
  * Author: Hamid Alinia - idehweb
  * Author URI: https://idehweb.com
  * Text Domain: webruno-crm
- * Requires at least: 5.8
+ * Requires at least: 5.9
  * Requires PHP: 7.4
  * License: GPLv2 or later
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
