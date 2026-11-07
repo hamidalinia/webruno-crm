@@ -346,6 +346,13 @@ class Webruno_Content_API {
         $w('/content/posts/(?P<id>\d+)/status', 'POST', 'route_set_status', 'permit_write');
         $w('/content/posts/(?P<id>\d+)/revisions', 'GET', 'route_list_revisions', 'permit');
         $w('/content/posts/(?P<id>\d+)/revisions/(?P<rev>\d+)/restore', 'POST', 'route_restore_revision', 'permit_write');
+        // F6c: classic menus, block navigations and header/footer parts of block themes.
+        $w('/content/menus', 'GET', 'route_menus', 'permit');
+        $w('/content/menus/(?P<id>\d+)', 'GET', 'route_menu', 'permit');
+        $w('/content/menus/(?P<id>\d+)/items', 'POST', 'route_set_menu_items', 'permit_write');
+        $w('/content/menus/(?P<id>\d+)/restore', 'POST', 'route_restore_menu', 'permit_write');
+        $w('/content/template-parts', 'GET', 'route_parts', 'permit');
+        $w('/content/template-parts/(?P<slug>[A-Za-z0-9_-]{1,100})/customize', 'POST', 'route_part_customize', 'permit_write');
     }
 
     /* ───────────────────────── helpers ───────────────────────── */
@@ -487,7 +494,7 @@ class Webruno_Content_API {
             $id = isset($params['id']) ? (int) $params['id'] : 0;
             self::$target = $id;
             $p = $id > 0 ? get_post($id) : null;
-            if (!$p || !in_array($p->post_type, ['post', 'page'], true)) return self::err('webruno_not_found', 404, __('Not found.', 'webruno-crm'));
+            if (!$p || !in_array($p->post_type, array_merge(['post', 'page'], self::TYPES_BLOCK), true)) return self::err('webruno_not_found', 404, __('Not found.', 'webruno-crm'));
             if (!current_user_can('read_post', $id)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not read this item.', 'webruno-crm'));
 
             $out = self::post_summary($p);
@@ -682,7 +689,7 @@ class Webruno_Content_API {
     }
 
     /** Validates title / content / excerpt / slug that are present in $data. Returns array of wp_insert_post fields or WP_Error. */
-    private static function text_fields(array $data) {
+    private static function text_fields(array $data, $block = false) {
         $out = [];
         if (array_key_exists('title', $data)) {
             if (!is_string($data['title']) || trim($data['title']) === '' || mb_strlen($data['title']) > 300) return self::err('webruno_bad_request', 400, __('title must be a non-empty text of at most 300 characters.', 'webruno-crm'));
@@ -690,7 +697,7 @@ class Webruno_Content_API {
         }
         if (array_key_exists('content', $data)) {
             if (!is_string($data['content']) || mb_strlen($data['content']) > self::max_chars()) return self::err('webruno_too_large', 413, __('content must be text within the size limit.', 'webruno-crm'));
-            $out['post_content'] = self::clean_content($data['content']);
+            $out['post_content'] = $block ? self::clean_block_content($data['content']) : self::clean_content($data['content']);
         }
         if (array_key_exists('excerpt', $data)) {
             if (!is_string($data['excerpt']) || mb_strlen($data['excerpt']) > 1000) return self::err('webruno_bad_request', 400, __('excerpt must be text of at most 1000 characters.', 'webruno-crm'));
@@ -718,12 +725,13 @@ class Webruno_Content_API {
     }
 
     /** Loads a post or page for writing and checks the connected user's capability. */
-    private static function writable_post($request, $cap = 'edit_post') {
+    private static function writable_post($request, $cap = 'edit_post', $blocks = true) {
         $params = $request->get_url_params();
         $id = isset($params['id']) ? (int) $params['id'] : 0;
         self::$target = $id;
         $p = $id > 0 ? get_post($id) : null;
-        if (!$p || !in_array($p->post_type, ['post', 'page'], true)) return self::err('webruno_not_found', 404, __('Not found.', 'webruno-crm'));
+        $types = $blocks ? array_merge(['post', 'page'], self::TYPES_BLOCK) : ['post', 'page'];
+        if (!$p || !in_array($p->post_type, $types, true)) return self::err('webruno_not_found', 404, __('Not found.', 'webruno-crm'));
         if (!current_user_can($cap, $id)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not change this item.', 'webruno-crm'));
         return $p;
     }
@@ -785,12 +793,13 @@ class Webruno_Content_API {
             if (is_wp_error($p)) return $p;
             $data = self::json_body($request, ['expected_modified_gmt', 'title', 'content', 'excerpt', 'slug', 'confirm_live']);
             if (is_wp_error($data)) return $data;
+            if (isset($data['slug']) && in_array($p->post_type, self::TYPES_BLOCK, true)) return self::err('webruno_bad_request', 400, __('The slug of a header, footer or navigation cannot be changed.', 'webruno-crm'));
             if ($p->post_status === 'trash') return self::err('webruno_conflict', 409, __('This item is in the trash. Restore it first (status route).', 'webruno-crm'));
             $ok = self::check_expected($p, $data);
             if (is_wp_error($ok)) return $ok;
             $ok = self::require_live_confirmation($p, $data);
             if (is_wp_error($ok)) return $ok;
-            $f = self::text_fields($data);
+            $f = self::text_fields($data, in_array($p->post_type, self::TYPES_BLOCK, true));
             if (is_wp_error($f)) return $f;
             if (!$f) return self::err('webruno_bad_request', 400, __('Nothing to change: send title, content, excerpt or slug.', 'webruno-crm'));
 
@@ -805,7 +814,7 @@ class Webruno_Content_API {
 
     public static function route_set_status($request) {
         return self::respond('set_status', function ($q) use ($request) {
-            $p = self::writable_post($request);
+            $p = self::writable_post($request, 'edit_post', false);
             if (is_wp_error($p)) return $p;
             $data = self::json_body($request, ['status', 'expected_modified_gmt', 'confirm']);
             if (is_wp_error($data)) return $data;
@@ -878,6 +887,297 @@ class Webruno_Content_API {
         });
     }
 
+    /* ───────────────────────── menus and header/footer parts (F6c) ───────────────────────── */
+
+    const MENU_MAX_ITEMS = 200;
+    const OPT_MENU_SNAP  = 'webruno_crm_menu_snapshots'; // not autoloaded; the last 5 states of each menu
+    const TYPES_BLOCK    = ['wp_template_part', 'wp_navigation'];
+
+    private static function theme_caps_error() {
+        if (!current_user_can('edit_theme_options')) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not change menus or theme parts.', 'webruno-crm'));
+        return true;
+    }
+
+    /** Block markup (header, footer, navigation): like clean_content(), but inline SVG icons (social links, logos) survive. */
+    private static function clean_block_content($content) {
+        $content = preg_replace('#<(script|style|iframe|object|embed|noscript)\b[^>]*>.*?</\1\s*>#is', '', (string) $content);
+        $content = preg_replace('#<(script|style|iframe|object|embed|noscript)\b.*$#is', '', (string) $content);
+        $allowed = wp_kses_allowed_html('post');
+        $svg_attrs = ['class' => true, 'id' => true, 'viewbox' => true, 'width' => true, 'height' => true, 'fill' => true, 'stroke' => true,
+            'd' => true, 'points' => true, 'x' => true, 'y' => true, 'cx' => true, 'cy' => true, 'r' => true, 'rx' => true, 'ry' => true,
+            'x1' => true, 'y1' => true, 'x2' => true, 'y2' => true, 'transform' => true, 'xmlns' => true, 'role' => true,
+            'aria-hidden' => true, 'aria-label' => true, 'focusable' => true, 'fill-rule' => true, 'clip-rule' => true,
+            'stroke-width' => true, 'stroke-linecap' => true, 'stroke-linejoin' => true, 'opacity' => true];
+        foreach (['svg', 'g', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'ellipse', 'title'] as $tag) $allowed[$tag] = $svg_attrs;
+        return wp_kses((string) $content, $allowed);
+    }
+
+    private static function menu_item_row($it) {
+        return [
+            'id' => (int) $it->ID, 'title' => wp_strip_all_tags((string) $it->title), 'url' => (string) $it->url,
+            'parent' => (int) $it->menu_item_parent, 'order' => (int) $it->menu_order,
+            'type' => (string) $it->type, 'object' => (string) $it->object, 'object_id' => (int) $it->object_id,
+            'target' => (string) $it->target,
+        ];
+    }
+
+    private static function menu_items_of($menu_id) {
+        $items = wp_get_nav_menu_items($menu_id, ['post_status' => 'any', 'update_post_term_cache' => false]);
+        $rows = [];
+        if (is_array($items)) { foreach ($items as $it) $rows[] = self::menu_item_row($it); }
+        return $rows;
+    }
+
+    private static function menu_hash(array $rows) { return sha1((string) wp_json_encode($rows)); }
+
+    /** Rows with real item IDs -> a list with parent_index (position of the parent in the list). Used for snapshots and for applying. */
+    private static function rows_to_spec(array $rows) {
+        $pos = [];
+        foreach ($rows as $i => $r) $pos[$r['id']] = $i;
+        $out = [];
+        foreach ($rows as $r) {
+            $out[] = ['title' => $r['title'], 'url' => $r['url'], 'type' => $r['type'], 'object' => $r['object'], 'object_id' => $r['object_id'],
+                      'target' => $r['target'], 'parent_index' => ($r['parent'] > 0 && isset($pos[$r['parent']])) ? $pos[$r['parent']] : null];
+        }
+        return $out;
+    }
+
+    /** Validates the items the caller sent. Returns the normalised list or WP_Error. */
+    private static function menu_spec_from_input($items) {
+        if (!is_array($items) || ($items && array_values($items) !== $items)) return self::err('webruno_bad_request', 400, __('items must be a list.', 'webruno-crm'));
+        if (count($items) > self::MENU_MAX_ITEMS) return self::err('webruno_too_large', 413, __('Too many menu items.', 'webruno-crm'));
+        $public_types = array_diff(get_post_types(['public' => true]), ['attachment']);
+        $public_taxes = get_taxonomies(['public' => true]);
+        $out = [];
+        foreach ($items as $i => $it) {
+            if (!is_array($it)) return self::err('webruno_bad_request', 400, __('Each menu item must be an object.', 'webruno-crm'));
+            foreach (array_keys($it) as $k) {
+                if (!in_array($k, ['title', 'url', 'type', 'object', 'object_id', 'target', 'parent_index'], true)) {
+                    /* translators: %s: field name */
+                    return self::err('webruno_bad_request', 400, sprintf(__('Unknown menu item field: %s', 'webruno-crm'), sanitize_key((string) $k)));
+                }
+            }
+            $type = isset($it['type']) ? $it['type'] : 'custom';
+            if (!in_array($type, ['custom', 'post_type', 'taxonomy'], true)) return self::err('webruno_bad_request', 400, __('type must be custom, post_type or taxonomy.', 'webruno-crm'));
+            $title = (isset($it['title']) && is_string($it['title'])) ? trim(sanitize_text_field($it['title'])) : '';
+            if (mb_strlen($title) > 200) return self::err('webruno_bad_request', 400, __('A menu item title may have at most 200 characters.', 'webruno-crm'));
+            $url = '';
+            $object = '';
+            $object_id = 0;
+            if ($type === 'custom') {
+                if ($title === '') return self::err('webruno_bad_request', 400, __('A custom link needs a title.', 'webruno-crm'));
+                $raw = (isset($it['url']) && is_string($it['url'])) ? trim($it['url']) : '';
+                $url = ($raw !== '' && mb_strlen($raw) <= 2000) ? esc_url_raw($raw, ['http', 'https', 'mailto', 'tel']) : '';
+                if ($url === '') return self::err('webruno_bad_request', 400, __('A custom link needs a valid url (https://, a path starting with /, #anchor, mailto: or tel:).', 'webruno-crm'));
+                $object = 'custom';
+            } else {
+                $object = (isset($it['object']) && is_string($it['object'])) ? $it['object'] : '';
+                $object_id = (isset($it['object_id']) && is_int($it['object_id'])) ? $it['object_id'] : 0;
+                if ($object_id <= 0) return self::err('webruno_bad_request', 400, __('object_id must be a positive whole number.', 'webruno-crm'));
+                if ($type === 'post_type') {
+                    $p = in_array($object, $public_types, true) ? get_post($object_id) : null;
+                    if (!$p || $p->post_type !== $object || $p->post_status === 'trash') return self::err('webruno_bad_request', 400, __('A linked page or post was not found.', 'webruno-crm'));
+                } else {
+                    $t = in_array($object, $public_taxes, true) ? get_term($object_id, $object) : null;
+                    if (!$t || is_wp_error($t)) return self::err('webruno_bad_request', 400, __('A linked category or tag was not found.', 'webruno-crm'));
+                }
+            }
+            $parent = null;
+            if (isset($it['parent_index'])) {
+                if (!is_int($it['parent_index']) || $it['parent_index'] < 0 || $it['parent_index'] >= $i) return self::err('webruno_bad_request', 400, __('parent_index must be the position of an earlier item in the list (the first item is 0).', 'webruno-crm'));
+                $parent = $it['parent_index'];
+            }
+            $out[] = ['title' => $title, 'url' => $url, 'type' => $type, 'object' => $object, 'object_id' => $object_id,
+                      'target' => (isset($it['target']) && $it['target'] === '_blank') ? '_blank' : '', 'parent_index' => $parent];
+        }
+        return $out;
+    }
+
+    private static function menu_apply($menu_id, array $spec) {
+        $ids = [];
+        foreach ($spec as $i => $s) {
+            $args = [
+                'menu-item-type' => $s['type'], 'menu-item-status' => 'publish', 'menu-item-position' => $i + 1,
+                'menu-item-parent-id' => ($s['parent_index'] !== null && isset($ids[$s['parent_index']])) ? $ids[$s['parent_index']] : 0,
+                'menu-item-target' => $s['target'],
+            ];
+            if ($s['type'] === 'custom') {
+                $args['menu-item-title'] = $s['title'];
+                $args['menu-item-url'] = $s['url'];
+            } else {
+                $args['menu-item-object'] = $s['object'];
+                $args['menu-item-object-id'] = $s['object_id'];
+                if ($s['title'] !== '') $args['menu-item-title'] = $s['title'];
+            }
+            $id = wp_update_nav_menu_item($menu_id, 0, $args);
+            if (is_wp_error($id) || !$id) return false;
+            $ids[$i] = (int) $id;
+        }
+        return true;
+    }
+
+    /** Replaces all items of a menu. If anything fails half way, the previous items are put back. */
+    private static function menu_replace($menu_id, array $spec) {
+        $old_spec = self::rows_to_spec(self::menu_items_of($menu_id));
+        foreach (self::menu_items_of($menu_id) as $r) wp_delete_post($r['id'], true);
+        if (self::menu_apply($menu_id, $spec)) return true;
+        foreach (self::menu_items_of($menu_id) as $r) wp_delete_post($r['id'], true);
+        self::menu_apply($menu_id, $old_spec);
+        return false;
+    }
+
+    private static function menu_snap_push($menu_id, array $spec) {
+        $all = get_option(self::OPT_MENU_SNAP, []);
+        if (!is_array($all)) $all = [];
+        $list = (isset($all[$menu_id]) && is_array($all[$menu_id])) ? $all[$menu_id] : [];
+        array_unshift($list, ['ts' => time(), 'spec' => $spec]);
+        $all[$menu_id] = array_slice($list, 0, 5);
+        update_option(self::OPT_MENU_SNAP, $all, false);
+    }
+
+    /** Returns the most recent saved state of the menu and removes it from the list, or null. */
+    private static function menu_snap_pop($menu_id) {
+        $all = get_option(self::OPT_MENU_SNAP, []);
+        if (!is_array($all) || empty($all[$menu_id]) || !is_array($all[$menu_id])) return null;
+        $first = array_shift($all[$menu_id]);
+        update_option(self::OPT_MENU_SNAP, $all, false);
+        return (is_array($first) && isset($first['spec']) && is_array($first['spec'])) ? $first['spec'] : null;
+    }
+
+    private static function loaded_menu($request) {
+        $params = $request->get_url_params();
+        $id = isset($params['id']) ? (int) $params['id'] : 0;
+        self::$target = $id;
+        $ok = self::theme_caps_error();
+        if (is_wp_error($ok)) return $ok;
+        $menu = $id > 0 ? wp_get_nav_menu_object($id) : false;
+        if (!$menu || is_wp_error($menu)) return self::err('webruno_not_found', 404, __('Not found.', 'webruno-crm'));
+        return $menu;
+    }
+
+    private static function menu_result($menu, array $extra = []) {
+        $rows = self::menu_items_of((int) $menu->term_id);
+        return array_merge(['id' => (int) $menu->term_id, 'name' => $menu->name, 'items' => $rows, 'items_hash' => self::menu_hash($rows)], $extra);
+    }
+
+    public static function route_menus($request) {
+        return self::respond('menus', function ($q) {
+            $ok = self::theme_caps_error();
+            if (is_wp_error($ok)) return $ok;
+            $locs = get_nav_menu_locations();
+            $reg  = get_registered_nav_menus();
+            $menus = [];
+            foreach (wp_get_nav_menus() as $m) {
+                $where = [];
+                foreach ((array) $locs as $loc => $mid) { if ((int) $mid === (int) $m->term_id) $where[] = isset($reg[$loc]) ? $reg[$loc] : $loc; }
+                $menus[] = ['id' => (int) $m->term_id, 'name' => $m->name, 'slug' => $m->slug, 'item_count' => (int) $m->count, 'locations' => $where];
+            }
+            $navs = [];
+            foreach (get_posts(['post_type' => 'wp_navigation', 'post_status' => ['publish', 'draft'], 'numberposts' => 50, 'orderby' => 'title', 'order' => 'ASC']) as $n) {
+                $navs[] = ['id' => (int) $n->ID, 'title' => wp_strip_all_tags($n->post_title), 'status' => $n->post_status, 'modified_gmt' => self::modified_iso($n)];
+            }
+            return ['block_theme' => (bool) wp_is_block_theme(), 'menus' => $menus, 'navigations' => $navs,
+                    'note' => 'menus: classic menus, edited with the menu items routes. navigations: block theme menus, edited like a post (content is block markup).'];
+        });
+    }
+
+    public static function route_menu($request) {
+        return self::respond('menu', function ($q) use ($request) {
+            $menu = self::loaded_menu($request);
+            if (is_wp_error($menu)) return $menu;
+            return self::menu_result($menu);
+        });
+    }
+
+    public static function route_set_menu_items($request) {
+        return self::respond('set_menu_items', function ($q) use ($request) {
+            $menu = self::loaded_menu($request);
+            if (is_wp_error($menu)) return $menu;
+            $data = self::json_body($request, ['items', 'expected_items_hash', 'confirm']);
+            if (is_wp_error($data)) return $data;
+            if (!isset($data['confirm']) || $data['confirm'] !== true) return self::err('webruno_confirm_required', 400, __('Changing a menu changes what visitors see. Ask the person to confirm, then send confirm: true.', 'webruno-crm'));
+            $cur = self::menu_items_of((int) $menu->term_id);
+            if (!isset($data['expected_items_hash']) || !is_string($data['expected_items_hash']) || !preg_match('/^[0-9a-f]{40}$/', $data['expected_items_hash'])) {
+                return self::err('webruno_bad_request', 400, __('expected_items_hash (the items_hash you got when you last read this menu) is required.', 'webruno-crm'));
+            }
+            if ($data['expected_items_hash'] !== self::menu_hash($cur)) return self::err('webruno_conflict', 409, __('This menu was changed on the site after you read it. Read it again before editing.', 'webruno-crm'));
+            if (!array_key_exists('items', $data)) return self::err('webruno_bad_request', 400, __('items is required (the complete new list of menu items).', 'webruno-crm'));
+            $spec = self::menu_spec_from_input($data['items']);
+            if (is_wp_error($spec)) return $spec;
+            self::menu_snap_push((int) $menu->term_id, self::rows_to_spec($cur));
+            if (!self::menu_replace((int) $menu->term_id, $spec)) return self::err('webruno_error', 500, __('Could not save the menu. The previous items were put back.', 'webruno-crm'));
+            return self::menu_result($menu, ['saved' => true, 'previous_state_saved' => true]);
+        });
+    }
+
+    public static function route_restore_menu($request) {
+        return self::respond('restore_menu', function ($q) use ($request) {
+            $menu = self::loaded_menu($request);
+            if (is_wp_error($menu)) return $menu;
+            $data = self::json_body($request, ['expected_items_hash', 'confirm']);
+            if (is_wp_error($data)) return $data;
+            if (!isset($data['confirm']) || $data['confirm'] !== true) return self::err('webruno_confirm_required', 400, __('Restoring a menu changes what visitors see. Ask the person to confirm, then send confirm: true.', 'webruno-crm'));
+            $cur = self::menu_items_of((int) $menu->term_id);
+            if (!isset($data['expected_items_hash']) || !is_string($data['expected_items_hash']) || $data['expected_items_hash'] !== self::menu_hash($cur)) {
+                return self::err('webruno_conflict', 409, __('This menu was changed on the site after you read it. Read it again before restoring.', 'webruno-crm'));
+            }
+            $spec = self::menu_snap_pop((int) $menu->term_id);
+            if ($spec === null) return self::err('webruno_not_found', 404, __('Nothing to restore for this menu.', 'webruno-crm'));
+            if (!self::menu_replace((int) $menu->term_id, $spec)) return self::err('webruno_error', 500, __('Could not restore the menu. The current items were kept.', 'webruno-crm'));
+            return self::menu_result($menu, ['restored' => true]);
+        });
+    }
+
+    /** Header, footer and other template parts of a block theme. Classic themes have none: the answer says so. */
+    public static function route_parts($request) {
+        return self::respond('parts', function ($q) {
+            $ok = self::theme_caps_error();
+            if (is_wp_error($ok)) return $ok;
+            if (!wp_is_block_theme()) {
+                return ['block_theme' => false, 'items' => [], 'note' => 'This site uses a classic (non-block) theme. Header and footer of classic themes, and of Elementor or other page builders, cannot be edited through this connection.'];
+            }
+            $items = [];
+            foreach (get_block_templates([], 'wp_template_part') as $t) {
+                $id = isset($t->wp_id) ? (int) $t->wp_id : 0;
+                $p  = $id > 0 ? get_post($id) : null;
+                $items[] = ['slug' => (string) $t->slug, 'title' => wp_strip_all_tags((string) $t->title), 'area' => (string) $t->area,
+                            'customized' => $id > 0, 'id' => $id > 0 ? $id : null, 'modified_gmt' => $p ? self::modified_iso($p) : null];
+            }
+            return ['block_theme' => true, 'theme' => get_stylesheet(), 'items' => $items,
+                    'note' => 'To edit a part: call customize for its slug (gives its id), read it as a post, then update it. Parts that are not customized yet have no id.'];
+        });
+    }
+
+    /** Makes sure the part has its own copy in the database (a copy of the theme file the first time) and returns its id. */
+    public static function route_part_customize($request) {
+        return self::respond('part_customize', function ($q) use ($request) {
+            $ok = self::theme_caps_error();
+            if (is_wp_error($ok)) return $ok;
+            $data = self::json_body($request, []);
+            if (is_wp_error($data)) return $data;
+            if (!wp_is_block_theme()) return self::err('webruno_bad_request', 400, __('This site does not use a block theme.', 'webruno-crm'));
+            $params = $request->get_url_params();
+            $slug = isset($params['slug']) ? sanitize_key((string) $params['slug']) : '';
+            $theme = get_stylesheet();
+            $tpl = $slug !== '' ? get_block_template($theme . '//' . $slug, 'wp_template_part') : null;
+            if (!$tpl) return self::err('webruno_not_found', 404, __('Not found.', 'webruno-crm'));
+            $existing = isset($tpl->wp_id) ? (int) $tpl->wp_id : 0;
+            if ($existing > 0 && get_post($existing)) {
+                self::$target = $existing;
+                return array_merge(self::post_summary(get_post($existing)), ['created' => false]);
+            }
+            $id = wp_insert_post(wp_slash([
+                'post_type' => 'wp_template_part', 'post_name' => $slug, 'post_title' => (string) $tpl->title,
+                'post_content' => (string) $tpl->content, 'post_status' => 'publish', 'post_author' => get_current_user_id(),
+            ]), true);
+            if (is_wp_error($id) || !$id) return self::err('webruno_error', 500, __('Could not prepare the part for editing.', 'webruno-crm'));
+            wp_set_post_terms($id, $theme, 'wp_theme');
+            if (!empty($tpl->area)) wp_set_post_terms($id, (string) $tpl->area, 'wp_template_part_area');
+            self::$target = (int) $id;
+            return array_merge(self::post_summary(get_post($id)), ['created' => true]);
+        });
+    }
+
     /* ───────────────────────── settings page section ───────────────────────── */
 
     public static function handle_save() {
@@ -940,7 +1240,7 @@ class Webruno_Content_API {
                             <input type="checkbox" name="webruno_content_write" value="1" <?php checked(self::write_enabled()); ?> <?php disabled(!$has_key); ?> />
                             <?php esc_html_e('Allow Webruno to edit content', 'webruno-crm'); ?>
                         </label>
-                        <p class="description"><?php esc_html_e('Webruno (and AI assistants you connect) can then create drafts and edit the title, text, excerpt and address of posts and pages, publish them or move them to the trash. Nothing else on your site can be changed. Before every edit a revision of the current version is saved so you can undo it (Edit post > Revisions). Scripts are always removed from what is written. Needs "Read content" to be on.', 'webruno-crm'); ?></p>
+                        <p class="description"><?php esc_html_e('Webruno (and AI assistants you connect) can then create drafts and edit the title, text, excerpt and address of posts and pages, publish them or move them to the trash. They can also change your navigation menus, and the header, footer and navigation of a block theme. Nothing else on your site can be changed. Before every edit of a post, page, header, footer or block navigation a revision of the current version is saved so you can undo it (Revisions). Before a menu is changed its previous state is kept so Webruno can put it back. Scripts are always removed from what is written. Needs "Read content" to be on.', 'webruno-crm'); ?></p>
                     </td>
                 </tr>
             </table>
