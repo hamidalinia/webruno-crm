@@ -29,6 +29,7 @@ require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-sync.php';
 require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-bulk-sync.php';
 require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-webhook.php';
 require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-content-api.php';
+require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-mcp-guide.php';
 
 add_action('plugins_loaded', 'webruno_crm_init');
 function webruno_crm_init() {
@@ -39,6 +40,7 @@ function webruno_crm_init() {
     Webruno_Bulk_Sync::init();
     Webruno_Webhook::init();
     Webruno_Content_API::init();
+    Webruno_MCP_Guide::init();
 }
 
 register_deactivation_hook(__FILE__, function () {

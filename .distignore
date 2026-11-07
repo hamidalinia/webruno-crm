@@ -1,0 +1,9 @@
+.git
+.gitignore
+.distignore
+.DS_Store
+tests
+*.bak-*
+*.zip
+node_modules
+.github
