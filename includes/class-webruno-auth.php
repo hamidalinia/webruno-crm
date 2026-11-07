@@ -200,6 +200,12 @@ class Webruno_Auth {
                 update_option('webruno_crm_customer_id', sanitize_text_field((string) $body['customerId']), false);
             }
             update_option('webruno_crm_connected_at', current_time('mysql'), false);
+            // Key for the signed content API. Handed out once by Webruno; stored encrypted; consent switches start OFF.
+            if (!empty($body['signingSecret']) && is_string($body['signingSecret'])) {
+                Webruno_Content_API::store_connection($body['signingSecret'], get_current_user_id());
+            } else {
+                Webruno_Content_API::clear_connection();
+            }
             delete_transient(self::CHALLENGE_TRANSIENT);
 
             wp_send_json_success([
@@ -286,6 +292,8 @@ class Webruno_Auth {
         update_option('webruno_crm_domain', $domain);
         update_option('webruno_crm_api_token', self::encrypt($token), false);
         update_option('webruno_crm_connected_at', current_time('mysql'), false);
+        // A pasted token carries no content-access key; make sure no older key stays active.
+        Webruno_Content_API::clear_connection();
 
         wp_send_json_success([
             'status'       => 'approved',
@@ -301,6 +309,7 @@ class Webruno_Auth {
         delete_option('webruno_crm_api_token');
         delete_option('webruno_crm_connected_at');
         delete_option('webruno_crm_customer_id');
+        Webruno_Content_API::clear_connection();
         delete_transient(self::CHALLENGE_TRANSIENT);
 
         wp_send_json_success(['message' => __('Disconnected from Webruno.', 'webruno-crm')]);

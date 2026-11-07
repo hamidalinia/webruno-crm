@@ -257,6 +257,7 @@ class Webruno_Admin {
                 </table>
                 <?php submit_button(); ?>
             </form>
+            <?php if (class_exists('Webruno_Content_API')) { Webruno_Content_API::render_settings_section(); } ?>
         </div>
         <?php
     }

@@ -1,0 +1,75 @@
+{
+  "_doc": "Shared signing test vectors. canonical = METHOD\\nROUTE\\nQUERY\\nTIMESTAMP\\nNONCE\\nsha256hex(body); signature = hex(HMAC-SHA256(secret, canonical)). ROUTE is the WP REST route without /wp-json. QUERY: params except rest_route, keys sorted bytewise asc, rawurlencode(k)=rawurlencode(v) joined by &. Read by PHP (plugin), JS (tenant). Never use this secret anywhere real.",
+  "secret": "test-signing-secret-NOT-A-REAL-KEY",
+  "vectors": [
+    {
+      "name": "get_no_query_empty_body",
+      "method": "GET",
+      "route": "/webruno/v1/content/site",
+      "query": {},
+      "timestamp": "1760000000",
+      "nonce": "a1b2c3d4e5f60718",
+      "body": "",
+      "expected_canonical": "GET\n/webruno/v1/content/site\n\n1760000000\na1b2c3d4e5f60718\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "expected_body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "expected_signature": "fd13697628f20e6301e5b630648134f015bcacf7a48388cf87b0b6147f72046f"
+    },
+    {
+      "name": "get_query_sorted_encoded_rest_route_dropped",
+      "method": "get",
+      "route": "/webruno/v1/content/posts",
+      "query": {
+        "search": "café (new)!'*",
+        "post_type": "page",
+        "page": 2,
+        "rest_route": "/ignored/route"
+      },
+      "timestamp": "1760000123",
+      "nonce": "Zz9_-Aa0Bb1Cc2Dd3",
+      "body": "",
+      "expected_canonical": "GET\n/webruno/v1/content/posts\npage=2&post_type=page&search=caf%C3%A9%20%28new%29%21%27%2A\n1760000123\nZz9_-Aa0Bb1Cc2Dd3\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "expected_body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "expected_signature": "5cf0b2d1319152b3c3a199e88397639b7f7af2fede7b8c8ae895d106d7abfda5"
+    },
+    {
+      "name": "post_unicode_json_body",
+      "method": "POST",
+      "route": "/webruno/v1/content/posts",
+      "query": {},
+      "timestamp": "1760000999",
+      "nonce": "nonce_0123456789abcdef0123456789ABCDEF",
+      "body": "{\"title\":\"سلام دنیا\",\"content\":\"<p>é</p>\",\"status\":\"draft\"}",
+      "expected_canonical": "POST\n/webruno/v1/content/posts\n\n1760000999\nnonce_0123456789abcdef0123456789ABCDEF\n55f5593e420b9fb68ee4ed4aab033f298af038186d36e2d5465122045fa330e8",
+      "expected_body_sha256": "55f5593e420b9fb68ee4ed4aab033f298af038186d36e2d5465122045fa330e8",
+      "expected_signature": "b93d2530e3d340efd329ba3bf37e6d6abfc585c11a278200253c683865add820"
+    },
+    {
+      "name": "get_byte_order_upper_before_lower_and_empty_value",
+      "method": "GET",
+      "route": "/webruno/v1/content/terms",
+      "query": {
+        "b": "1",
+        "B": "2",
+        "a": "",
+        "_x": "3",
+        "Z": "4"
+      },
+      "timestamp": "1760001000",
+      "nonce": "NNNNNNNNNNNNNNNN",
+      "body": "",
+      "expected_canonical": "GET\n/webruno/v1/content/terms\nB=2&Z=4&_x=3&a=&b=1\n1760001000\nNNNNNNNNNNNNNNNN\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "expected_body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "expected_signature": "29174ace4f54b8b0fa6c5502775daf2d95e223ba9ff3c1af5fae82c944f01904"
+    }
+  ],
+  "rejected_queries": [
+    {
+      "name": "array_param_bracket",
+      "raw_query": "a%5B%5D=1"
+    },
+    {
+      "name": "array_param_assoc",
+      "raw_query": "a%5Bk%5D=1"
+    }
+  ]
+}
