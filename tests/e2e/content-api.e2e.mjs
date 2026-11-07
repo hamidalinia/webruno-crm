@@ -92,8 +92,15 @@ const routes = JSON.parse(wpPhp('$o=[]; foreach (rest_get_server()->get_routes()
 const POST_OK = new Set(['/webruno/v1/content/posts', '/webruno/v1/content/posts/(?P<id>\\d+)', '/webruno/v1/content/posts/(?P<id>\\d+)/status', '/webruno/v1/content/posts/(?P<id>\\d+)/revisions/(?P<rev>\\d+)/restore',
     // F6c
     '/webruno/v1/content/menus/(?P<id>\\d+)/items', '/webruno/v1/content/menus/(?P<id>\\d+)/restore',
-    '/webruno/v1/content/template-parts/(?P<slug>[A-Za-z0-9_-]{1,100})/customize']);
-ok(Object.keys(routes).length >= 10 && Object.entries(routes).every(([p, m]) => m.every((x) => x === 'GET' || (x === 'POST' && POST_OK.has(p)))), 'route table: GET everywhere, POST only on the known write routes (F6b posts, F6c menus and parts)', JSON.stringify(routes));
+    '/webruno/v1/content/template-parts/(?P<slug>[A-Za-z0-9_-]{1,100})/customize',
+    // F6d: terms and products
+    '/webruno/v1/content/terms', '/webruno/v1/content/terms/(?P<id>\\d+)', '/webruno/v1/content/products', '/webruno/v1/content/products/(?P<id>\\d+)',
+    '/webruno/v1/content/products/(?P<id>\\d+)/restore', '/webruno/v1/content/products/(?P<id>\\d+)/status',
+    // F6e: variations and confirmed deletes
+    '/webruno/v1/content/products/(?P<id>\\d+)/variations', '/webruno/v1/content/products/(?P<id>\\d+)/variations/(?P<vid>\\d+)',
+    '/webruno/v1/content/products/(?P<id>\\d+)/variations/(?P<vid>\\d+)/delete', '/webruno/v1/content/products/(?P<id>\\d+)/delete',
+    '/webruno/v1/content/posts/(?P<id>\\d+)/delete', '/webruno/v1/content/terms/(?P<id>\\d+)/delete', '/webruno/v1/content/menus/(?P<id>\\d+)/delete']);
+ok(Object.keys(routes).length >= 10 && Object.entries(routes).every(([p, m]) => m.every((x) => x === 'GET' || (x === 'POST' && POST_OK.has(p)))), 'route table: GET everywhere, POST only on the known write routes (F6b-F6e)', JSON.stringify(routes));
 ok([...POST_OK].every((p) => (routes[p] || []).includes('POST')), 'all four write routes are registered');
 clearAudit();
 const wr = [];

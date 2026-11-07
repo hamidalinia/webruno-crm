@@ -41,6 +41,8 @@ After connecting, open Webruno CRM > Connect to AI. That page shows your MCP add
 5. In Cursor: add {"mcpServers":{"webruno":{"url":"<address>"}}} to .cursor/mcp.json.
 6. Ask your AI: "List my Webruno websites".
 
+What the AI can do (only after you switch editing on): create drafts and edit posts, pages, categories and tags, simple and variable WooCommerce products with their variations, navigation menus and the header/footer of block themes. New items are always drafts. Publishing, trashing and changing something that is already live needs a confirmation that the AI asks you for in the chat. Permanent deletion (posts, pages, products, variations, categories, menus) is refused unless the AI sends an explicit confirmation after asking you; trashing stays the recoverable way to remove something.
+
 == Frequently Asked Questions ==
 
 = Do I need a Webruno account? =

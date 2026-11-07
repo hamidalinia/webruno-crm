@@ -14,7 +14,7 @@
  *   QUERY  = query params except rest_route; keys sorted bytewise; rawurlencode(k)=rawurlencode(v); joined by "&"
  *
  * F6a: GET routes (read). F6b: POST routes for posts and pages only (create as draft, update, status, restore a revision),
- * available only when the site admin switched "edit" on. No media upload, no WooCommerce changes, no meta, no authors, no hard delete.
+ * available only when the site admin switched "edit" on. No media upload, no meta, no authors. F6d: terms and WooCommerce products. F6e: variable products with variations and permanent deletes (always behind an explicit confirm_delete: true that the AI must get from the person first).
  */
 if (!defined('ABSPATH')) exit;
 
@@ -32,7 +32,7 @@ class Webruno_Content_API {
     const WINDOW       = 300;   // seconds, +/-
     const NONCE_KEEP   = 900;   // nonces older than 15 minutes are pruned (window is 5 minutes)
     const AUDIT_CAP    = 1000;  // rotating log
-    const WRITE_AVAILABLE = true;  // F6b: posts and pages. The site admin's "edit" switch (default OFF) still has to be on.
+    const WRITE_AVAILABLE = true;  // F6b: posts and pages, F6d: terms and simple products. The site admin's "edit" switch (default OFF) still has to be on.
 
     private static $ctx    = null;
     private static $route  = '';
@@ -346,6 +346,22 @@ class Webruno_Content_API {
         $w('/content/posts/(?P<id>\d+)/status', 'POST', 'route_set_status', 'permit_write');
         $w('/content/posts/(?P<id>\d+)/revisions', 'GET', 'route_list_revisions', 'permit');
         $w('/content/posts/(?P<id>\d+)/revisions/(?P<rev>\d+)/restore', 'POST', 'route_restore_revision', 'permit_write');
+        // F6d: terms (create / rename) and WooCommerce simple products (draft create, edit with undo, status).
+        $w('/content/terms', 'POST', 'route_create_term', 'permit_write');
+        $w('/content/terms/(?P<id>\\d+)', 'POST', 'route_update_term', 'permit_write');
+        $w('/content/products', 'POST', 'route_create_product', 'permit_write');
+        $w('/content/products/(?P<id>\\d+)', 'POST', 'route_update_product', 'permit_write');
+        $w('/content/products/(?P<id>\\d+)/restore', 'POST', 'route_restore_product', 'permit_write');
+        $w('/content/products/(?P<id>\\d+)/status', 'POST', 'route_set_product_status', 'permit_write');
+        // F6e: variations of variable products and permanent deletes (every delete needs confirm_delete: true).
+        $w('/content/products/(?P<id>\d+)/variations', 'GET', 'route_variations', 'permit');
+        $w('/content/products/(?P<id>\d+)/variations', 'POST', 'route_create_variation', 'permit_write');
+        $w('/content/products/(?P<id>\d+)/variations/(?P<vid>\d+)', 'POST', 'route_update_variation', 'permit_write');
+        $w('/content/products/(?P<id>\d+)/variations/(?P<vid>\d+)/delete', 'POST', 'route_delete_variation', 'permit_write');
+        $w('/content/products/(?P<id>\d+)/delete', 'POST', 'route_delete_product', 'permit_write');
+        $w('/content/posts/(?P<id>\d+)/delete', 'POST', 'route_delete_post', 'permit_write');
+        $w('/content/terms/(?P<id>\d+)/delete', 'POST', 'route_delete_term', 'permit_write');
+        $w('/content/menus/(?P<id>\d+)/delete', 'POST', 'route_delete_menu', 'permit_write');
         // F6c: classic menus, block navigations and header/footer parts of block themes.
         $w('/content/menus', 'GET', 'route_menus', 'permit');
         $w('/content/menus/(?P<id>\d+)', 'GET', 'route_menu', 'permit');
@@ -534,7 +550,8 @@ class Webruno_Content_API {
             $items = [];
             foreach ($terms as $t) {
                 $items[] = ['id' => (int) $t->term_id, 'name' => $t->name, 'slug' => $t->slug, 'taxonomy' => $t->taxonomy,
-                            'parent' => (int) $t->parent, 'count' => (int) $t->count, 'description' => wp_strip_all_tags($t->description)];
+                            'parent' => (int) $t->parent, 'count' => (int) $t->count, 'description' => wp_strip_all_tags($t->description),
+                            'version' => self::term_version($t)]; // needed as expected_version to rename or delete the term
             }
             return self::page_result($items, is_wp_error($total) ? count($items) : (int) $total, $page, $per);
         });
@@ -647,7 +664,7 @@ class Webruno_Content_API {
             }
             $out['attributes'] = $attrs;
             $out['variations'] = method_exists($product, 'get_children') ? count((array) $product->get_children()) : 0;
-            return $out;
+            return array_merge($out, self::variable_extras($product));
         });
     }
 
@@ -762,12 +779,12 @@ class Webruno_Content_API {
         $p = get_post($p->ID);
         $out = self::post_summary($p);
         $out['block_count'] = self::block_count($p->post_content);
-        return array_merge($out, $extra);
+        return array_merge($out, self::post_terms_out($p), $extra);
     }
 
     public static function route_create_post($request) {
         return self::respond('create_post', function ($q) use ($request) {
-            $data = self::json_body($request, ['post_type', 'title', 'content', 'excerpt', 'slug', 'status']);
+            $data = self::json_body($request, ['post_type', 'title', 'content', 'excerpt', 'slug', 'status', 'category_ids', 'tag_ids']);
             if (is_wp_error($data)) return $data;
             if (isset($data['status'])) return self::err('webruno_bad_request', 400, __('New items are always created as drafts. Publish with the status route after the person confirmed.', 'webruno-crm'));
             $type = isset($data['post_type']) ? $data['post_type'] : 'post';
@@ -777,12 +794,15 @@ class Webruno_Content_API {
             if (!isset($data['title'])) return self::err('webruno_bad_request', 400, __('title is required.', 'webruno-crm'));
             $f = self::text_fields($data);
             if (is_wp_error($f)) return $f;
+            $terms = self::post_term_input($data, $type);
+            if (is_wp_error($terms)) return $terms;
             $f['post_type']   = $type;
             $f['post_status'] = 'draft';
             $f['post_author'] = get_current_user_id();
             $id = wp_insert_post(wp_slash($f), true);
             if (is_wp_error($id) || !$id) return self::err('webruno_error', 500, __('Could not create the item.', 'webruno-crm'));
             self::$target = (int) $id;
+            foreach ($terms as $tax => $ids) wp_set_object_terms((int) $id, $ids, $tax, false);
             return self::write_result(get_post($id), ['created' => true]);
         });
     }
@@ -791,7 +811,7 @@ class Webruno_Content_API {
         return self::respond('update_post', function ($q) use ($request) {
             $p = self::writable_post($request);
             if (is_wp_error($p)) return $p;
-            $data = self::json_body($request, ['expected_modified_gmt', 'title', 'content', 'excerpt', 'slug', 'confirm_live']);
+            $data = self::json_body($request, ['expected_modified_gmt', 'title', 'content', 'excerpt', 'slug', 'confirm_live', 'category_ids', 'tag_ids']);
             if (is_wp_error($data)) return $data;
             if (isset($data['slug']) && in_array($p->post_type, self::TYPES_BLOCK, true)) return self::err('webruno_bad_request', 400, __('The slug of a header, footer or navigation cannot be changed.', 'webruno-crm'));
             if ($p->post_status === 'trash') return self::err('webruno_conflict', 409, __('This item is in the trash. Restore it first (status route).', 'webruno-crm'));
@@ -801,14 +821,21 @@ class Webruno_Content_API {
             if (is_wp_error($ok)) return $ok;
             $f = self::text_fields($data, in_array($p->post_type, self::TYPES_BLOCK, true));
             if (is_wp_error($f)) return $f;
-            if (!$f) return self::err('webruno_bad_request', 400, __('Nothing to change: send title, content, excerpt or slug.', 'webruno-crm'));
+            $terms = self::post_term_input($data, $p->post_type);
+            if (is_wp_error($terms)) return $terms;
+            if (!$f && !$terms) return self::err('webruno_bad_request', 400, __('Nothing to change: send title, content, excerpt, slug, category_ids or tag_ids.', 'webruno-crm'));
 
             $before = self::snapshot($p);
             if (!$before) return self::revisions_off_error();
-            $f['ID'] = $p->ID;
-            $res = wp_update_post(wp_slash($f), true);
-            if (is_wp_error($res) || !$res) return self::err('webruno_error', 500, __('Could not update the item.', 'webruno-crm'));
-            return self::write_result($p, ['revision_before' => $before]);
+            $previous_terms = $terms ? self::post_terms_out($p) : [];
+            if ($f) {
+                $f['ID'] = $p->ID;
+                $res = wp_update_post(wp_slash($f), true);
+                if (is_wp_error($res) || !$res) return self::err('webruno_error', 500, __('Could not update the item.', 'webruno-crm'));
+            }
+            foreach ($terms as $tax => $ids) wp_set_object_terms((int) $p->ID, $ids, $tax, false);
+            // categories and tags are not part of a revision: the previous ones are returned so they can be set back by hand
+            return self::write_result($p, ['revision_before' => $before] + ($terms ? ['previous_terms' => $previous_terms] : []));
         });
     }
 
@@ -816,35 +843,40 @@ class Webruno_Content_API {
         return self::respond('set_status', function ($q) use ($request) {
             $p = self::writable_post($request, 'edit_post', false);
             if (is_wp_error($p)) return $p;
-            $data = self::json_body($request, ['status', 'expected_modified_gmt', 'confirm']);
-            if (is_wp_error($data)) return $data;
-            $target = isset($data['status']) ? $data['status'] : null;
-            if (!in_array($target, ['draft', 'pending', 'publish', 'trash'], true)) return self::err('webruno_bad_request', 400, __('status must be draft, pending, publish or trash.', 'webruno-crm'));
-            $ok = self::check_expected($p, $data);
-            if (is_wp_error($ok)) return $ok;
-            // Publishing, trashing, or taking a live item offline (live -> draft/pending) all change what visitors see.
-            $changes_visibility = in_array($target, ['publish', 'trash'], true) || (self::live_status($p) && $p->post_status !== $target);
-            if ($changes_visibility && (!isset($data['confirm']) || $data['confirm'] !== true)) {
-                return self::err('webruno_confirm_required', 400, __('Publishing or trashing needs the person\'s confirmation. Ask them, then send confirm: true.', 'webruno-crm'));
-            }
-            $pt = get_post_type_object($p->post_type);
-            if ($target === 'publish' && !current_user_can($pt->cap->publish_posts)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not publish this content.', 'webruno-crm'));
-            if ($target === 'trash' && !current_user_can('delete_post', $p->ID)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not trash this item.', 'webruno-crm'));
-            $prev_status = $p->post_status;
-            if ($prev_status === $target) return self::write_result($p, ['unchanged' => true]);
-
-            if ($p->post_status === 'trash') {
-                wp_untrash_post($p->ID);
-                $p = get_post($p->ID);
-            }
-            if ($target === 'trash') {
-                if (!wp_trash_post($p->ID)) return self::err('webruno_error', 500, __('Could not trash the item.', 'webruno-crm'));
-            } elseif ($p->post_status !== $target) {
-                $res = wp_update_post(['ID' => $p->ID, 'post_status' => $target], true);
-                if (is_wp_error($res) || !$res) return self::err('webruno_error', 500, __('Could not change the status.', 'webruno-crm'));
-            }
-            return self::write_result($p, ['previous_status' => $prev_status]);
+            return self::apply_status($request, $p);
         });
+    }
+
+    /** draft / pending / publish / trash for a post, page or product (the caller already checked the item and edit_post). */
+    private static function apply_status($request, $p) {
+        $data = self::json_body($request, ['status', 'expected_modified_gmt', 'confirm']);
+        if (is_wp_error($data)) return $data;
+        $target = isset($data['status']) ? $data['status'] : null;
+        if (!in_array($target, ['draft', 'pending', 'publish', 'trash'], true)) return self::err('webruno_bad_request', 400, __('status must be draft, pending, publish or trash.', 'webruno-crm'));
+        $ok = self::check_expected($p, $data);
+        if (is_wp_error($ok)) return $ok;
+        // Publishing, trashing, or taking a live item offline (live -> draft/pending) all change what visitors see.
+        $changes_visibility = in_array($target, ['publish', 'trash'], true) || (self::live_status($p) && $p->post_status !== $target);
+        if ($changes_visibility && (!isset($data['confirm']) || $data['confirm'] !== true)) {
+            return self::err('webruno_confirm_required', 400, __('Publishing or trashing needs the person\'s confirmation. Ask them, then send confirm: true.', 'webruno-crm'));
+        }
+        $pt = get_post_type_object($p->post_type);
+        if ($target === 'publish' && !current_user_can($pt->cap->publish_posts)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not publish this content.', 'webruno-crm'));
+        if ($target === 'trash' && !current_user_can('delete_post', $p->ID)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not trash this item.', 'webruno-crm'));
+        $prev_status = $p->post_status;
+        if ($prev_status === $target) return self::write_result($p, ['unchanged' => true]);
+
+        if ($p->post_status === 'trash') {
+            wp_untrash_post($p->ID);
+            $p = get_post($p->ID);
+        }
+        if ($target === 'trash') {
+            if (!wp_trash_post($p->ID)) return self::err('webruno_error', 500, __('Could not trash the item.', 'webruno-crm'));
+        } elseif ($p->post_status !== $target) {
+            $res = wp_update_post(['ID' => $p->ID, 'post_status' => $target], true);
+            if (is_wp_error($res) || !$res) return self::err('webruno_error', 500, __('Could not change the status.', 'webruno-crm'));
+        }
+        return self::write_result($p, ['previous_status' => $prev_status]);
     }
 
     public static function route_list_revisions($request) {
@@ -884,6 +916,870 @@ class Webruno_Content_API {
             if (!$before) return self::revisions_off_error();
             if (!wp_restore_post_revision($rev->ID)) return self::err('webruno_error', 500, __('Could not restore the revision.', 'webruno-crm'));
             return self::write_result($p, ['revision_before' => $before, 'restored_revision' => (int) $rev->ID]);
+        });
+    }
+
+    /* ───────────────────────── terms, products and post categories (F6d) ─────────────────────────
+     * Same safety model as posts: the admin's "edit" switch -> the connected user's capabilities -> new products are
+     * always drafts -> every change of an existing product first saves its previous state (undo with the restore route)
+     * -> changing something live needs the person's confirmation. Terms can be created, renamed and (F6e) deleted after confirmation.
+     * Simple and variable products can be edited (grouped and external products are refused with a clear message).
+     */
+
+    const OPT_PROD_SNAP = 'webruno_crm_product_snapshots'; // not autoloaded; the last 5 states of each product
+    const WRITE_TAXES   = ['category', 'post_tag', 'product_cat', 'product_tag'];
+
+    private static function term_version($t) {
+        return sha1((string) wp_json_encode([(string) $t->name, (string) $t->slug, (int) $t->parent, (string) $t->description]));
+    }
+
+    private static function term_row($t, array $extra = []) {
+        return array_merge([
+            'id' => (int) $t->term_id, 'name' => $t->name, 'slug' => $t->slug, 'taxonomy' => $t->taxonomy,
+            'parent' => (int) $t->parent, 'count' => (int) $t->count, 'description' => wp_strip_all_tags($t->description),
+            'version' => self::term_version($t),
+        ], $extra);
+    }
+
+    /** The taxonomy object a write may touch, or WP_Error. */
+    private static function write_taxonomy($tax) {
+        if (!is_string($tax) || !in_array($tax, self::WRITE_TAXES, true)) {
+            return self::err('webruno_bad_request', 400, __('taxonomy must be category, post_tag, product_cat or product_tag.', 'webruno-crm'));
+        }
+        if (strpos($tax, 'product_') === 0 && !self::wc_ready()) {
+            return self::err('webruno_woocommerce_missing', 404, __('WooCommerce is not active on this site.', 'webruno-crm'));
+        }
+        $obj = taxonomy_exists($tax) ? get_taxonomy($tax) : null;
+        if (!$obj) return self::err('webruno_not_found', 404, __('Not found.', 'webruno-crm'));
+        return $obj;
+    }
+
+    /** A JSON list of positive whole numbers (unique), at most $max long. Returns the list or WP_Error. */
+    private static function id_list($v, $max, $key) {
+        if (!is_array($v) || ($v && array_values($v) !== $v) || count($v) > $max) {
+            /* translators: 1: field name, 2: maximum number of entries */
+            return self::err('webruno_bad_request', 400, sprintf(__('%1$s must be a list of at most %2$d IDs.', 'webruno-crm'), sanitize_key((string) $key), (int) $max));
+        }
+        $out = [];
+        foreach ($v as $id) {
+            if (!is_int($id) || $id <= 0 || $id > 2147483647) {
+                /* translators: %s: field name */
+                return self::err('webruno_bad_request', 400, sprintf(__('%s must contain only positive whole numbers.', 'webruno-crm'), sanitize_key((string) $key)));
+            }
+            $out[$id] = $id;
+        }
+        return array_values($out);
+    }
+
+    /** name / slug / description of a term. Returns the checked fields that are present, or WP_Error. */
+    private static function term_text_fields(array $data) {
+        $out = [];
+        if (array_key_exists('name', $data)) {
+            if (!is_string($data['name']) || trim($data['name']) === '' || mb_strlen($data['name']) > 200) return self::err('webruno_bad_request', 400, __('name must be a non-empty text of at most 200 characters.', 'webruno-crm'));
+            $out['name'] = sanitize_text_field($data['name']);
+            if ($out['name'] === '') return self::err('webruno_bad_request', 400, __('name must be a non-empty text of at most 200 characters.', 'webruno-crm'));
+        }
+        if (array_key_exists('slug', $data)) {
+            if (!is_string($data['slug']) || mb_strlen($data['slug']) > 200) return self::err('webruno_bad_request', 400, __('slug must be text of at most 200 characters.', 'webruno-crm'));
+            $out['slug'] = sanitize_title($data['slug']);
+            if ($out['slug'] === '') return self::err('webruno_bad_request', 400, __('slug has no usable characters.', 'webruno-crm'));
+        }
+        if (array_key_exists('description', $data)) {
+            if (!is_string($data['description']) || mb_strlen($data['description']) > 1000) return self::err('webruno_bad_request', 400, __('description must be text of at most 1000 characters.', 'webruno-crm'));
+            $out['description'] = sanitize_textarea_field($data['description']);
+        }
+        return $out;
+    }
+
+    /** The parent of a term: null = not sent, otherwise 0 or an existing term of the same (hierarchical) taxonomy. */
+    private static function parent_term(array $data, $tax_obj) {
+        if (!array_key_exists('parent', $data)) return null;
+        if (!is_int($data['parent']) || $data['parent'] < 0) return self::err('webruno_bad_request', 400, __('parent must be 0 or the ID of an existing category.', 'webruno-crm'));
+        if ($data['parent'] === 0) return 0;
+        if (!$tax_obj->hierarchical) return self::err('webruno_bad_request', 400, __('Only categories can have a parent.', 'webruno-crm'));
+        $pt = get_term($data['parent'], $tax_obj->name);
+        if (!$pt || is_wp_error($pt)) return self::err('webruno_bad_request', 400, __('The parent category was not found.', 'webruno-crm'));
+        return (int) $data['parent'];
+    }
+
+    public static function route_create_term($request) {
+        return self::respond('create_term', function ($q) use ($request) {
+            $data = self::json_body($request, ['taxonomy', 'name', 'slug', 'parent', 'description']);
+            if (is_wp_error($data)) return $data;
+            $obj = self::write_taxonomy(isset($data['taxonomy']) ? $data['taxonomy'] : null);
+            if (is_wp_error($obj)) return $obj;
+            if (!current_user_can($obj->cap->manage_terms)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not create these terms.', 'webruno-crm'));
+            if (!isset($data['name'])) return self::err('webruno_bad_request', 400, __('name is required.', 'webruno-crm'));
+            $f = self::term_text_fields($data);
+            if (is_wp_error($f)) return $f;
+            $parent = self::parent_term($data, $obj);
+            if (is_wp_error($parent)) return $parent;
+            $args = [];
+            if (isset($f['slug'])) $args['slug'] = $f['slug'];
+            if (isset($f['description'])) $args['description'] = $f['description'];
+            if ($parent) $args['parent'] = $parent;
+            $res = wp_insert_term(wp_slash($f['name']), $obj->name, wp_slash($args));
+            if (is_wp_error($res)) {
+                if ($res->get_error_code() === 'term_exists') return self::err('webruno_conflict', 409, __('A term with this name or slug already exists here.', 'webruno-crm'));
+                return self::err('webruno_error', 500, __('Could not create the term.', 'webruno-crm'));
+            }
+            self::$target = (int) $res['term_id'];
+            $t = get_term((int) $res['term_id'], $obj->name);
+            if (!$t || is_wp_error($t)) return self::err('webruno_error', 500, __('Could not create the term.', 'webruno-crm'));
+            return self::term_row($t, ['created' => true]);
+        });
+    }
+
+    public static function route_update_term($request) {
+        return self::respond('update_term', function ($q) use ($request) {
+            $params = $request->get_url_params();
+            $id = isset($params['id']) ? (int) $params['id'] : 0;
+            self::$target = $id;
+            $t = $id > 0 ? get_term($id) : null;
+            if (!$t || is_wp_error($t) || !in_array($t->taxonomy, self::WRITE_TAXES, true)) return self::err('webruno_not_found', 404, __('Not found.', 'webruno-crm'));
+            $obj = self::write_taxonomy($t->taxonomy);
+            if (is_wp_error($obj)) return $obj;
+            if (!current_user_can('edit_term', $id)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not change this term.', 'webruno-crm'));
+            $data = self::json_body($request, ['expected_version', 'name', 'slug', 'parent', 'description', 'confirm_live']);
+            if (is_wp_error($data)) return $data;
+            if (!isset($data['expected_version']) || !is_string($data['expected_version']) || !preg_match('/^[0-9a-f]{40}$/', $data['expected_version'])) {
+                return self::err('webruno_bad_request', 400, __('expected_version (the version you got when you last read this term) is required.', 'webruno-crm'));
+            }
+            if ($data['expected_version'] !== self::term_version($t)) return self::err('webruno_conflict', 409, __('This term was changed on the site after you read it. Read it again before editing.', 'webruno-crm'));
+            $f = self::term_text_fields($data);
+            if (is_wp_error($f)) return $f;
+            $parent = self::parent_term($data, $obj);
+            if (is_wp_error($parent)) return $parent;
+            if ($parent !== null && $parent === $id) return self::err('webruno_bad_request', 400, __('A category cannot be its own parent.', 'webruno-crm'));
+            if (!$f && $parent === null) return self::err('webruno_bad_request', 400, __('Nothing to change: send name, slug, parent or description.', 'webruno-crm'));
+            $args = $f;
+            if ($parent !== null) $args['parent'] = $parent;
+            $previous = [];
+            foreach ($args as $k => $v) { if ((string) $t->$k !== (string) $v) $previous[$k] = ($k === 'parent') ? (int) $t->$k : (string) $t->$k; }
+            if (!$previous) return self::term_row($t, ['unchanged' => true]);
+            $visible = isset($previous['name']) || isset($previous['slug']) || isset($previous['parent']);
+            if ($visible && (int) $t->count > 0 && (!isset($data['confirm_live']) || $data['confirm_live'] !== true)) {
+                /* translators: %d: number of items */
+                return self::err('webruno_confirm_live_required', 400, sprintf(__('This term is used by %d items on the site, so the change is visible to visitors. Ask the person to confirm, then send confirm_live: true.', 'webruno-crm'), (int) $t->count));
+            }
+            $res = wp_update_term($id, $t->taxonomy, wp_slash($args));
+            if (is_wp_error($res)) {
+                if ($res->get_error_code() === 'term_exists' || $res->get_error_code() === 'duplicate_term_slug') return self::err('webruno_conflict', 409, __('A term with this name or slug already exists here.', 'webruno-crm'));
+                return self::err('webruno_error', 500, __('Could not update the term.', 'webruno-crm'));
+            }
+            $fresh = get_term($id, $t->taxonomy);
+            return self::term_row($fresh, ['previous' => $previous]);
+        });
+    }
+
+    /** category_ids / tag_ids of a post write. Returns [taxonomy => ids] for the keys that were sent, or WP_Error. */
+    private static function post_term_input(array $data, $post_type) {
+        $out = [];
+        foreach (['category_ids' => 'category', 'tag_ids' => 'post_tag'] as $key => $tax) {
+            if (!array_key_exists($key, $data)) continue;
+            if ($post_type !== 'post') return self::err('webruno_bad_request', 400, __('category_ids and tag_ids are only for posts, not for pages.', 'webruno-crm'));
+            $ids = self::id_list($data[$key], 50, $key);
+            if (is_wp_error($ids)) return $ids;
+            $obj = get_taxonomy($tax);
+            if (!$obj || !current_user_can($obj->cap->assign_terms)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not assign these terms.', 'webruno-crm'));
+            foreach ($ids as $tid) {
+                $t = get_term($tid, $tax);
+                if (!$t || is_wp_error($t)) return self::err('webruno_bad_request', 400, __('A category or tag in the list was not found.', 'webruno-crm'));
+            }
+            $out[$tax] = $ids;
+        }
+        return $out;
+    }
+
+    private static function post_terms_out($p) {
+        if ($p->post_type !== 'post') return [];
+        $cats = [];
+        $tags = [];
+        foreach ((array) wp_get_post_terms($p->ID, 'category') as $t) { if (!is_wp_error($t)) $cats[] = ['id' => (int) $t->term_id, 'name' => $t->name]; }
+        foreach ((array) wp_get_post_terms($p->ID, 'post_tag') as $t) { if (!is_wp_error($t)) $tags[] = ['id' => (int) $t->term_id, 'name' => $t->name]; }
+        return ['categories' => $cats, 'tags' => $tags];
+    }
+
+    /* ── products (WooCommerce: simple and variable products) ── */
+
+    private static function product_state($product) {
+        $cats = array_map('intval', (array) $product->get_category_ids('edit'));
+        sort($cats);
+        $state = [
+            'name' => (string) $product->get_name('edit'), 'slug' => (string) $product->get_slug('edit'),
+            'description' => (string) $product->get_description('edit'), 'short_description' => (string) $product->get_short_description('edit'),
+            'regular_price' => (string) $product->get_regular_price('edit'), 'sale_price' => (string) $product->get_sale_price('edit'),
+            'sku' => (string) $product->get_sku('edit'), 'manage_stock' => (bool) $product->get_manage_stock('edit'),
+            'stock_quantity' => $product->get_stock_quantity('edit') === null ? null : (int) $product->get_stock_quantity('edit'),
+            'stock_status' => (string) $product->get_stock_status('edit'), 'category_ids' => $cats,
+        ];
+        if ($product->is_type('variable')) {
+            // a variable product has no price of its own; its own attributes are part of its state so an undo can put them back
+            unset($state['regular_price'], $state['sale_price']);
+            $state['attributes'] = self::attr_specs($product);
+        }
+        return $state;
+    }
+
+    /** Applies the fields present in $s and saves. Returns true or WP_Error (WooCommerce refusals such as a duplicate SKU). */
+    private static function product_apply($product, array $s) {
+        try {
+            if (array_key_exists('name', $s)) $product->set_name($s['name']);
+            if (array_key_exists('slug', $s)) $product->set_slug($s['slug']);
+            if (array_key_exists('description', $s)) $product->set_description($s['description']);
+            if (array_key_exists('short_description', $s)) $product->set_short_description($s['short_description']);
+            if (array_key_exists('regular_price', $s)) $product->set_regular_price($s['regular_price']);
+            if (array_key_exists('sale_price', $s)) $product->set_sale_price($s['sale_price']);
+            if (array_key_exists('sku', $s)) $product->set_sku($s['sku']);
+            if (array_key_exists('manage_stock', $s)) $product->set_manage_stock($s['manage_stock']);
+            if (array_key_exists('stock_quantity', $s)) $product->set_stock_quantity($s['stock_quantity']);
+            if (array_key_exists('stock_status', $s)) $product->set_stock_status($s['stock_status']);
+            if (array_key_exists('category_ids', $s)) $product->set_category_ids($s['category_ids']);
+            if (array_key_exists('attributes', $s)) $product->set_attributes(self::attrs_merge($product, $s['attributes']));
+            $product->save();
+            if ($product->is_type('variable')) {
+                WC_Product_Variable::sync($product->get_id());
+                wc_delete_product_transients($product->get_id());
+            }
+        } catch (Exception $e) {
+            return self::err('webruno_conflict', 409, __('WooCommerce did not accept the values (for example the SKU is already used by another product).', 'webruno-crm'));
+        }
+        return true;
+    }
+
+    private static function price_text($v, $key) {
+        if (!is_string($v) || ($v !== '' && !preg_match('/^\d{1,10}(\.\d{1,4})?$/', $v))) {
+            /* translators: %s: field name */
+            return self::err('webruno_bad_request', 400, sprintf(__('%s must be a price like 19.90 (digits, optional decimals) or an empty text to clear it.', 'webruno-crm'), sanitize_key((string) $key)));
+        }
+        return $v;
+    }
+
+    /** Checks the product fields that are present. Returns the cleaned fields or WP_Error. */
+    private static function product_fields(array $data) {
+        $out = [];
+        if (array_key_exists('name', $data)) {
+            if (!is_string($data['name']) || trim($data['name']) === '' || mb_strlen($data['name']) > 300) return self::err('webruno_bad_request', 400, __('name must be a non-empty text of at most 300 characters.', 'webruno-crm'));
+            $out['name'] = sanitize_text_field($data['name']);
+            if ($out['name'] === '') return self::err('webruno_bad_request', 400, __('name must be a non-empty text of at most 300 characters.', 'webruno-crm'));
+        }
+        if (array_key_exists('slug', $data)) {
+            if (!is_string($data['slug']) || mb_strlen($data['slug']) > 200) return self::err('webruno_bad_request', 400, __('slug must be text of at most 200 characters.', 'webruno-crm'));
+            $out['slug'] = sanitize_title($data['slug']);
+        }
+        foreach (['description' => self::max_chars(), 'short_description' => 5000] as $k => $max) {
+            if (!array_key_exists($k, $data)) continue;
+            if (!is_string($data[$k]) || mb_strlen($data[$k]) > $max) return self::err('webruno_too_large', 413, __('description and short_description must be text within the size limit.', 'webruno-crm'));
+            $out[$k] = self::clean_content($data[$k]);
+        }
+        foreach (['regular_price', 'sale_price'] as $k) {
+            if (!array_key_exists($k, $data)) continue;
+            $v = self::price_text($data[$k], $k);
+            if (is_wp_error($v)) return $v;
+            $out[$k] = $v;
+        }
+        if (array_key_exists('sku', $data)) {
+            if (!is_string($data['sku']) || mb_strlen($data['sku']) > 100) return self::err('webruno_bad_request', 400, __('sku must be text of at most 100 characters.', 'webruno-crm'));
+            $out['sku'] = sanitize_text_field($data['sku']);
+        }
+        if (array_key_exists('manage_stock', $data)) {
+            if (!is_bool($data['manage_stock'])) return self::err('webruno_bad_request', 400, __('manage_stock must be true or false.', 'webruno-crm'));
+            $out['manage_stock'] = $data['manage_stock'];
+        }
+        if (array_key_exists('stock_quantity', $data)) {
+            if (!is_int($data['stock_quantity']) || $data['stock_quantity'] < 0 || $data['stock_quantity'] > 1000000) return self::err('webruno_bad_request', 400, __('stock_quantity must be a whole number from 0 to 1000000.', 'webruno-crm'));
+            $out['stock_quantity'] = $data['stock_quantity'];
+        }
+        if (array_key_exists('stock_status', $data)) {
+            if (!in_array($data['stock_status'], ['instock', 'outofstock', 'onbackorder'], true)) return self::err('webruno_bad_request', 400, __('stock_status must be instock, outofstock or onbackorder.', 'webruno-crm'));
+            $out['stock_status'] = $data['stock_status'];
+        }
+        if (array_key_exists('category_ids', $data)) {
+            $ids = self::id_list($data['category_ids'], 50, 'category_ids');
+            if (is_wp_error($ids)) return $ids;
+            $obj = get_taxonomy('product_cat');
+            if (!$obj || !current_user_can($obj->cap->assign_terms)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not assign product categories.', 'webruno-crm'));
+            foreach ($ids as $tid) {
+                $t = get_term($tid, 'product_cat');
+                if (!$t || is_wp_error($t)) return self::err('webruno_bad_request', 400, __('A product category in the list was not found.', 'webruno-crm'));
+            }
+            sort($ids);
+            $out['category_ids'] = $ids;
+        }
+        if (array_key_exists('attributes', $data)) {
+            $a = self::attrs_input($data['attributes']);
+            if (is_wp_error($a)) return $a;
+            $out['attributes'] = $a;
+        }
+        return $out;
+    }
+
+    private static function sale_below_regular(array $state) {
+        if ($state['regular_price'] === '' || $state['sale_price'] === '') return true;
+        return (float) $state['sale_price'] < (float) $state['regular_price'];
+    }
+
+    private static function product_full($id) {
+        $p = get_post((int) $id);
+        $product = $p ? wc_get_product($p->ID) : null;
+        if (!$p || !$product) return [];
+        $out = self::product_summary($p, $product);
+        $out['short_description'] = wp_kses_post($product->get_short_description());
+        $out['description'] = wp_kses_post($product->get_description());
+        return array_merge($out, self::variable_extras($product));
+    }
+
+    /** Loads a simple product for writing: returns [post, product] or WP_Error. */
+    private static function writable_product($request) {
+        if (!self::wc_ready()) return self::err('webruno_woocommerce_missing', 404, __('WooCommerce is not active on this site.', 'webruno-crm'));
+        $params = $request->get_url_params();
+        $id = isset($params['id']) ? (int) $params['id'] : 0;
+        self::$target = $id;
+        $p = $id > 0 ? get_post($id) : null;
+        if (!$p || $p->post_type !== 'product') return self::err('webruno_not_found', 404, __('Not found.', 'webruno-crm'));
+        if (!current_user_can('edit_post', $id)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not change this product.', 'webruno-crm'));
+        $product = wc_get_product($id);
+        if (!$product) return self::err('webruno_not_found', 404, __('Not found.', 'webruno-crm'));
+        return [$p, $product];
+    }
+
+    private static function prod_snap_push($id, array $state) {
+        $all = get_option(self::OPT_PROD_SNAP, []);
+        if (!is_array($all)) $all = [];
+        $list = (isset($all[$id]) && is_array($all[$id])) ? $all[$id] : [];
+        array_unshift($list, ['ts' => time(), 'state' => $state]);
+        $all[$id] = array_slice($list, 0, 5);
+        update_option(self::OPT_PROD_SNAP, $all, false);
+    }
+
+    private static function prod_snap_pop($id) {
+        $all = get_option(self::OPT_PROD_SNAP, []);
+        if (!is_array($all) || empty($all[$id]) || !is_array($all[$id])) return null;
+        $first = array_shift($all[$id]);
+        update_option(self::OPT_PROD_SNAP, $all, false);
+        return (is_array($first) && isset($first['state']) && is_array($first['state'])) ? $first['state'] : null;
+    }
+
+    public static function route_create_product($request) {
+        return self::respond('create_product', function ($q) use ($request) {
+            if (!self::wc_ready()) return self::err('webruno_woocommerce_missing', 404, __('WooCommerce is not active on this site.', 'webruno-crm'));
+            $data = self::json_body($request, ['type', 'name', 'slug', 'description', 'short_description', 'regular_price', 'sale_price', 'sku', 'manage_stock', 'stock_quantity', 'stock_status', 'category_ids', 'attributes']);
+            if (is_wp_error($data)) return $data;
+            $pt = get_post_type_object('product');
+            if (!$pt || !current_user_can($pt->cap->create_posts)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not create products.', 'webruno-crm'));
+            if (!isset($data['name'])) return self::err('webruno_bad_request', 400, __('name is required.', 'webruno-crm'));
+            $f = self::product_fields($data);
+            if (is_wp_error($f)) return $f;
+            $merged = array_merge(['regular_price' => '', 'sale_price' => ''], $f);
+            if (!self::sale_below_regular($merged)) return self::err('webruno_bad_request', 400, __('sale_price must be lower than regular_price.', 'webruno-crm'));
+            $type = isset($data['type']) ? $data['type'] : 'simple';
+            if (!in_array($type, ['simple', 'variable'], true)) return self::err('webruno_bad_request', 400, __('type must be simple or variable.', 'webruno-crm'));
+            if ($type === 'simple' && isset($f['attributes'])) return self::err('webruno_bad_request', 400, __('attributes are only for variable products (send type: variable).', 'webruno-crm'));
+            if ($type === 'variable' && (isset($f['regular_price']) || isset($f['sale_price']))) return self::err('webruno_bad_request', 400, __('A variable product has no price of its own: set the prices on its variations.', 'webruno-crm'));
+            $product = $type === 'variable' ? new WC_Product_Variable() : new WC_Product_Simple();
+            $product->set_status('draft');
+            $res = self::product_apply($product, $f);
+            if (is_wp_error($res)) return $res;
+            self::$target = (int) $product->get_id();
+            return array_merge(self::product_full($product->get_id()), ['created' => true]);
+        });
+    }
+
+    public static function route_update_product($request) {
+        return self::respond('update_product', function ($q) use ($request) {
+            $loaded = self::writable_product($request);
+            if (is_wp_error($loaded)) return $loaded;
+            list($p, $product) = $loaded;
+            $data = self::json_body($request, ['expected_modified_gmt', 'name', 'slug', 'description', 'short_description', 'regular_price', 'sale_price', 'sku', 'manage_stock', 'stock_quantity', 'stock_status', 'category_ids', 'attributes', 'confirm_live']);
+            if (is_wp_error($data)) return $data;
+            if ($p->post_status === 'trash') return self::err('webruno_conflict', 409, __('This product is in the trash. Restore it first (status route).', 'webruno-crm'));
+            if (!$product->is_type(['simple', 'variable'])) return self::err('webruno_bad_request', 400, __('Only simple and variable products can be edited through Webruno (grouped and external products are not supported).', 'webruno-crm'));
+            $ok = self::check_expected($p, $data);
+            if (is_wp_error($ok)) return $ok;
+            $ok = self::require_live_confirmation($p, $data);
+            if (is_wp_error($ok)) return $ok;
+            $f = self::product_fields($data);
+            if (is_wp_error($f)) return $f;
+            if (!$f) return self::err('webruno_bad_request', 400, __('Nothing to change: send at least one product field.', 'webruno-crm'));
+            $variable = $product->is_type('variable');
+            if (!$variable && isset($f['attributes'])) return self::err('webruno_bad_request', 400, __('attributes are only for variable products.', 'webruno-crm'));
+            if ($variable && (isset($f['regular_price']) || isset($f['sale_price']))) return self::err('webruno_bad_request', 400, __('A variable product has no price of its own: change the prices on its variations.', 'webruno-crm'));
+            if ($variable && isset($f['attributes'])) {
+                $bad = self::attrs_conflict($product, $f['attributes']);
+                if ($bad) {
+                    /* translators: %d: variation ID */
+                    return self::err('webruno_conflict', 409, sprintf(__('Variation %d still uses an attribute or value that would no longer exist. Change or delete that variation first.', 'webruno-crm'), (int) $bad));
+                }
+            }
+            $before = self::product_state($product);
+            if (!self::sale_below_regular(array_merge(['regular_price' => '', 'sale_price' => ''], $before, $f))) return self::err('webruno_bad_request', 400, __('sale_price must be lower than regular_price.', 'webruno-crm'));
+            self::prod_snap_push($p->ID, $before);
+            $res = self::product_apply($product, $f);
+            if (is_wp_error($res)) { self::prod_snap_pop($p->ID); return $res; }
+            return array_merge(self::product_full($p->ID), ['previous_state_saved' => true]);
+        });
+    }
+
+    public static function route_restore_product($request) {
+        return self::respond('restore_product', function ($q) use ($request) {
+            $loaded = self::writable_product($request);
+            if (is_wp_error($loaded)) return $loaded;
+            list($p, $product) = $loaded;
+            $data = self::json_body($request, ['expected_modified_gmt', 'confirm_live']);
+            if (is_wp_error($data)) return $data;
+            if ($p->post_status === 'trash') return self::err('webruno_conflict', 409, __('This product is in the trash. Restore it first (status route).', 'webruno-crm'));
+            if (!$product->is_type(['simple', 'variable'])) return self::err('webruno_bad_request', 400, __('Only simple and variable products can be edited through Webruno (grouped and external products are not supported).', 'webruno-crm'));
+            $ok = self::check_expected($p, $data);
+            if (is_wp_error($ok)) return $ok;
+            $ok = self::require_live_confirmation($p, $data);
+            if (is_wp_error($ok)) return $ok;
+            $state = self::prod_snap_pop($p->ID);
+            if ($state === null) return self::err('webruno_not_found', 404, __('Nothing to restore for this product.', 'webruno-crm'));
+            $res = self::product_apply($product, $state);
+            if (is_wp_error($res)) { self::prod_snap_push($p->ID, $state); return $res; }
+            return array_merge(self::product_full($p->ID), ['restored' => true]);
+        });
+    }
+
+    public static function route_set_product_status($request) {
+        return self::respond('set_product_status', function ($q) use ($request) {
+            $loaded = self::writable_product($request);
+            if (is_wp_error($loaded)) return $loaded;
+            return self::apply_status($request, $loaded[0]);
+        });
+    }
+
+    /* ───────────────────────── variable products, variations and permanent deletes (F6e) ─────────────────────────
+     * Variable products: the product has its own attributes (name + list of values, optionally used for variations);
+     * every variation fixes one value for each variation attribute and carries its own price, SKU and stock.
+     * Only the product's own (custom) attributes are managed; global attributes of the shop are kept as they are.
+     * Permanent deletes never happen without confirm_delete: true. The caller (the AI assistant) must ask the person
+     * in the chat first; the plugin refuses the request otherwise. Moving to the trash stays available (status route).
+     */
+
+    const ATTR_MAX      = 10;
+    const OPT_MAX       = 50;
+    const VARIATION_MAX = 100;
+    const VAR_FIELDS    = ['attributes', 'regular_price', 'sale_price', 'sku', 'manage_stock', 'stock_quantity', 'stock_status', 'enabled', 'confirm_live'];
+
+    private static function require_delete_confirmation(array $data, $what) {
+        if (!isset($data['confirm_delete']) || $data['confirm_delete'] !== true) {
+            /* translators: %s: what would be deleted */
+            return self::err('webruno_confirm_delete_required', 400, sprintf(__('This permanently deletes %s and cannot be undone. Ask the person to confirm the deletion, then send confirm_delete: true.', 'webruno-crm'), $what));
+        }
+        return true;
+    }
+
+    /** The editable attributes of a product (its own, non-global ones) in the form the write routes accept. */
+    private static function attr_specs($product) {
+        $out = [];
+        foreach ((array) $product->get_attributes() as $a) {
+            if (!is_object($a) || !method_exists($a, 'is_taxonomy') || $a->is_taxonomy()) continue;
+            $out[] = [
+                'name' => (string) $a->get_name(),
+                'options' => array_values(array_map('strval', (array) $a->get_options())),
+                'visible' => (bool) $a->get_visible(),
+                'variation' => (bool) $a->get_variation(),
+            ];
+        }
+        return $out;
+    }
+
+    private static function attrs_bad($msg) {
+        return self::err('webruno_bad_request', 400, $msg);
+    }
+
+    /** Checks a JSON list of attributes [{name, options, visible?, variation?}]. Returns the cleaned list or WP_Error. */
+    private static function attrs_input($v) {
+        if (!is_array($v) || ($v && array_values($v) !== $v) || count($v) > self::ATTR_MAX) {
+            /* translators: %d: maximum number of attributes */
+            return self::attrs_bad(sprintf(__('attributes must be a list of at most %d attributes.', 'webruno-crm'), self::ATTR_MAX));
+        }
+        $out = [];
+        $keys = [];
+        foreach ($v as $a) {
+            if (!is_array($a) || ($a && array_values($a) === $a)) return self::attrs_bad(__('Every attribute must be an object with name and options.', 'webruno-crm'));
+            foreach (array_keys($a) as $k) {
+                if (!in_array($k, ['name', 'options', 'visible', 'variation'], true)) return self::attrs_bad(__('Unknown field in an attribute (allowed: name, options, visible, variation).', 'webruno-crm'));
+            }
+            if (!isset($a['name']) || !is_string($a['name']) || trim($a['name']) === '' || mb_strlen($a['name']) > 100) return self::attrs_bad(__('Every attribute needs a name of at most 100 characters.', 'webruno-crm'));
+            $name = sanitize_text_field($a['name']);
+            $key = sanitize_title($name);
+            if ($name === '' || $key === '' || strpos($key, 'pa_') === 0 || isset($keys[$key])) return self::attrs_bad(__('Attribute names must be different from each other, must not start with pa_ and need usable characters.', 'webruno-crm'));
+            $keys[$key] = true;
+            if (!isset($a['options']) || !is_array($a['options']) || !$a['options'] || array_values($a['options']) !== $a['options'] || count($a['options']) > self::OPT_MAX) {
+                /* translators: %d: maximum number of values */
+                return self::attrs_bad(sprintf(__('options must be a list of 1 to %d values.', 'webruno-crm'), self::OPT_MAX));
+            }
+            $opts = [];
+            foreach ($a['options'] as $o) {
+                if (!is_string($o) || trim($o) === '' || mb_strlen($o) > 100 || strpos($o, '|') !== false) return self::attrs_bad(__('Every option must be a text of at most 100 characters without the | character.', 'webruno-crm'));
+                $o = sanitize_text_field($o);
+                if ($o === '' || in_array($o, $opts, true)) return self::attrs_bad(__('The options of an attribute must be different from each other.', 'webruno-crm'));
+                $opts[] = $o;
+            }
+            $vis = array_key_exists('visible', $a) ? $a['visible'] : true;
+            $var = array_key_exists('variation', $a) ? $a['variation'] : false;
+            if (!is_bool($vis) || !is_bool($var)) return self::attrs_bad(__('visible and variation must be true or false.', 'webruno-crm'));
+            $out[] = ['name' => $name, 'options' => $opts, 'visible' => $vis, 'variation' => $var];
+        }
+        return $out;
+    }
+
+    /** The product's global attributes are kept; its own attributes are replaced by $list. */
+    private static function attrs_merge($product, array $list) {
+        $attrs = [];
+        foreach ((array) $product->get_attributes() as $a) {
+            if (is_object($a) && method_exists($a, 'is_taxonomy') && $a->is_taxonomy()) $attrs[] = $a;
+        }
+        $pos = count($attrs);
+        foreach ($list as $a) {
+            $o = new WC_Product_Attribute();
+            $o->set_id(0);
+            $o->set_name($a['name']);
+            $o->set_options($a['options']);
+            $o->set_position($pos++);
+            $o->set_visible($a['visible']);
+            $o->set_variation($a['variation']);
+            $attrs[] = $o;
+        }
+        return $attrs;
+    }
+
+    /** The ID of a variation that would break if the product's own attributes became $list, or 0. */
+    private static function attrs_conflict($product, array $list) {
+        $by = [];
+        foreach ($list as $a) $by[sanitize_title($a['name'])] = $a['options'];
+        $global = [];
+        foreach ((array) $product->get_attributes() as $k => $a) {
+            if (is_object($a) && method_exists($a, 'is_taxonomy') && $a->is_taxonomy()) $global[$k] = true;
+        }
+        foreach ((array) $product->get_children() as $cid) {
+            $v = wc_get_product($cid);
+            if (!$v) continue;
+            foreach ((array) $v->get_attributes('edit') as $k => $val) {
+                if ($val === '' || isset($global[$k])) continue;
+                if (!isset($by[$k]) || !in_array((string) $val, $by[$k], true)) return (int) $cid;
+            }
+        }
+        return 0;
+    }
+
+    private static function variation_labels($product) {
+        $labels = [];
+        foreach (self::attr_specs($product) as $a) $labels[sanitize_title($a['name'])] = $a['name'];
+        return $labels;
+    }
+
+    private static function variation_row($v, array $labels) {
+        $post = get_post($v->get_id());
+        $attrs = [];
+        foreach ((array) $v->get_attributes('edit') as $k => $val) $attrs[isset($labels[$k]) ? $labels[$k] : (string) $k] = (string) $val;
+        return [
+            'id' => (int) $v->get_id(), 'attributes' => $attrs, 'sku' => (string) $v->get_sku('edit'),
+            'regular_price' => (string) $v->get_regular_price('edit'), 'sale_price' => (string) $v->get_sale_price('edit'),
+            'price' => (string) $v->get_price(), 'on_sale' => (bool) $v->is_on_sale(),
+            'manage_stock' => (bool) $v->get_manage_stock('edit'),
+            'stock_quantity' => $v->get_stock_quantity('edit') === null ? null : (int) $v->get_stock_quantity('edit'),
+            'stock_status' => (string) $v->get_stock_status('edit'),
+            'enabled' => $post ? $post->post_status === 'publish' : false,
+            'modified_gmt' => $post ? self::modified_iso($post) : null,
+        ];
+    }
+
+    private static function variation_rows($product) {
+        $labels = self::variation_labels($product);
+        $rows = [];
+        foreach (array_slice((array) $product->get_children(), 0, self::VARIATION_MAX) as $cid) {
+            $v = wc_get_product($cid);
+            if ($v && $v->is_type('variation')) $rows[] = self::variation_row($v, $labels);
+        }
+        return $rows;
+    }
+
+    /** Extra fields of a product read/write result: its own attributes, and for a variable product its variations. */
+    private static function variable_extras($product) {
+        $out = ['attribute_specs' => self::attr_specs($product)];
+        if ($product->is_type('variable')) $out['variation_items'] = self::variation_rows($product);
+        return $out;
+    }
+
+    /** {"Color": "Red"} -> ['color' => 'Red'], for the variation attributes of $product. Every variation attribute needs a value. */
+    private static function variation_attrs_input($input, $product) {
+        if (!is_array($input) || ($input && array_values($input) === $input)) {
+            return self::err('webruno_bad_request', 400, __('attributes must be an object such as {"Color": "Red"}.', 'webruno-crm'));
+        }
+        $specs = [];
+        foreach (self::attr_specs($product) as $a) {
+            if ($a['variation']) $specs[sanitize_title($a['name'])] = $a;
+        }
+        if (!$specs) return self::err('webruno_bad_request', 400, __('This product has no attribute marked variation: true. Set its attributes first.', 'webruno-crm'));
+        $out = [];
+        foreach ($input as $name => $val) {
+            $key = sanitize_title((string) $name);
+            if (!isset($specs[$key])) return self::err('webruno_bad_request', 400, __('Unknown variation attribute. Use the names listed in attribute_specs (variation: true).', 'webruno-crm'));
+            if (!is_string($val) || !in_array($val, $specs[$key]['options'], true)) return self::err('webruno_bad_request', 400, __('The value of a variation attribute must be exactly one of its options (as text).', 'webruno-crm'));
+            $out[$key] = $val;
+        }
+        foreach ($specs as $key => $a) {
+            if (!isset($out[$key])) return self::err('webruno_bad_request', 400, __('attributes must contain a value for every variation attribute.', 'webruno-crm'));
+        }
+        return $out;
+    }
+
+    private static function variation_duplicate($product, array $attrs, $skip_id) {
+        ksort($attrs);
+        foreach ((array) $product->get_children() as $cid) {
+            if ((int) $cid === (int) $skip_id) continue;
+            $v = wc_get_product($cid);
+            if (!$v) continue;
+            $a = array_map('strval', (array) $v->get_attributes('edit'));
+            ksort($a);
+            if ($a === $attrs) return true;
+        }
+        return false;
+    }
+
+    private static function enabled_input(array $data) {
+        if (!array_key_exists('enabled', $data)) return null;
+        if (!is_bool($data['enabled'])) return self::err('webruno_bad_request', 400, __('enabled must be true or false.', 'webruno-crm'));
+        return $data['enabled'];
+    }
+
+    private static function sync_variable($product_id) {
+        WC_Product_Variable::sync((int) $product_id);
+        wc_delete_product_transients((int) $product_id);
+    }
+
+    /** A variable product that is not in the trash, for writing: [post, product] or WP_Error. */
+    private static function variable_parent($request) {
+        $loaded = self::writable_product($request);
+        if (is_wp_error($loaded)) return $loaded;
+        list($p, $product) = $loaded;
+        if ($p->post_status === 'trash') return self::err('webruno_conflict', 409, __('This product is in the trash. Restore it first (status route).', 'webruno-crm'));
+        if (!$product->is_type('variable')) return self::err('webruno_bad_request', 400, __('Variations exist only on variable products.', 'webruno-crm'));
+        return [$p, $product];
+    }
+
+    /** [post, product, variation, variation post] or WP_Error. */
+    private static function writable_variation($request) {
+        $loaded = self::variable_parent($request);
+        if (is_wp_error($loaded)) return $loaded;
+        list($p, $product) = $loaded;
+        $params = $request->get_url_params();
+        $vid = isset($params['vid']) ? (int) $params['vid'] : 0;
+        self::$target = $vid;
+        $v = $vid > 0 ? wc_get_product($vid) : null;
+        $vp = $v ? get_post($vid) : null;
+        if (!$v || !$vp || !$v->is_type('variation') || (int) $v->get_parent_id() !== (int) $p->ID) return self::err('webruno_not_found', 404, __('Not found.', 'webruno-crm'));
+        return [$p, $product, $v, $vp];
+    }
+
+    public static function route_variations($request) {
+        return self::respond('variations', function ($q) use ($request) {
+            if (!self::wc_ready()) return self::err('webruno_woocommerce_missing', 404, __('WooCommerce is not active on this site.', 'webruno-crm'));
+            $params = $request->get_url_params();
+            $id = isset($params['id']) ? (int) $params['id'] : 0;
+            self::$target = $id;
+            $p = $id > 0 ? get_post($id) : null;
+            if (!$p || $p->post_type !== 'product') return self::err('webruno_not_found', 404, __('Not found.', 'webruno-crm'));
+            if (!current_user_can('read_post', $id)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not read this product.', 'webruno-crm'));
+            $product = wc_get_product($id);
+            if (!$product) return self::err('webruno_not_found', 404, __('Not found.', 'webruno-crm'));
+            if (!$product->is_type('variable')) return self::err('webruno_bad_request', 400, __('Variations exist only on variable products.', 'webruno-crm'));
+            return ['product_id' => $id, 'attribute_specs' => self::attr_specs($product), 'items' => self::variation_rows($product)];
+        });
+    }
+
+    public static function route_create_variation($request) {
+        return self::respond('create_variation', function ($q) use ($request) {
+            $loaded = self::variable_parent($request);
+            if (is_wp_error($loaded)) return $loaded;
+            list($p, $product) = $loaded;
+            $data = self::json_body($request, self::VAR_FIELDS);
+            if (is_wp_error($data)) return $data;
+            $ok = self::require_live_confirmation($p, $data);
+            if (is_wp_error($ok)) return $ok;
+            if (!isset($data['attributes'])) return self::err('webruno_bad_request', 400, __('attributes is required: a value for every attribute marked variation: true.', 'webruno-crm'));
+            $attrs = self::variation_attrs_input($data['attributes'], $product);
+            if (is_wp_error($attrs)) return $attrs;
+            $en = self::enabled_input($data);
+            if (is_wp_error($en)) return $en;
+            $d = $data;
+            unset($d['attributes']);
+            $f = self::product_fields($d);
+            if (is_wp_error($f)) return $f;
+            if (!self::sale_below_regular(array_merge(['regular_price' => '', 'sale_price' => ''], $f))) return self::err('webruno_bad_request', 400, __('sale_price must be lower than regular_price.', 'webruno-crm'));
+            if (count((array) $product->get_children()) >= self::VARIATION_MAX) {
+                /* translators: %d: maximum number of variations */
+                return self::err('webruno_conflict', 409, sprintf(__('A product can have at most %d variations through Webruno.', 'webruno-crm'), self::VARIATION_MAX));
+            }
+            if (self::variation_duplicate($product, $attrs, 0)) return self::err('webruno_conflict', 409, __('A variation with exactly these attribute values already exists.', 'webruno-crm'));
+
+            $v = new WC_Product_Variation();
+            $v->set_parent_id($p->ID);
+            $v->set_attributes($attrs);
+            $v->set_status($en === false ? 'private' : 'publish');
+            $res = self::product_apply($v, $f);
+            if (is_wp_error($res)) return $res;
+            self::$target = (int) $v->get_id();
+            self::sync_variable($p->ID);
+            $fresh = wc_get_product($p->ID);
+            $row = self::variation_row(wc_get_product($v->get_id()), self::variation_labels($fresh));
+            return ['created' => true, 'product_id' => (int) $p->ID, 'variation' => $row];
+        });
+    }
+
+    public static function route_update_variation($request) {
+        return self::respond('update_variation', function ($q) use ($request) {
+            $loaded = self::writable_variation($request);
+            if (is_wp_error($loaded)) return $loaded;
+            list($p, $product, $v, $vp) = $loaded;
+            $data = self::json_body($request, array_merge(['expected_modified_gmt'], self::VAR_FIELDS));
+            if (is_wp_error($data)) return $data;
+            // expected_modified_gmt is the modified_gmt of the VARIATION (as returned in variation_items)
+            $ok = self::check_expected($vp, $data);
+            if (is_wp_error($ok)) return $ok;
+            $ok = self::require_live_confirmation($p, $data);
+            if (is_wp_error($ok)) return $ok;
+            $attrs = null;
+            if (array_key_exists('attributes', $data)) {
+                $attrs = self::variation_attrs_input($data['attributes'], $product);
+                if (is_wp_error($attrs)) return $attrs;
+                if (self::variation_duplicate($product, $attrs, $v->get_id())) return self::err('webruno_conflict', 409, __('A variation with exactly these attribute values already exists.', 'webruno-crm'));
+            }
+            $en = self::enabled_input($data);
+            if (is_wp_error($en)) return $en;
+            $d = $data;
+            unset($d['attributes']);
+            $f = self::product_fields($d);
+            if (is_wp_error($f)) return $f;
+            if (!$f && $attrs === null && $en === null) return self::err('webruno_bad_request', 400, __('Nothing to change: send attributes, a price, sku, stock fields or enabled.', 'webruno-crm'));
+            $cur = self::product_state($v);
+            if (!self::sale_below_regular(array_merge(['regular_price' => '', 'sale_price' => ''], array_intersect_key($cur, ['regular_price' => 1, 'sale_price' => 1]), $f))) {
+                return self::err('webruno_bad_request', 400, __('sale_price must be lower than regular_price.', 'webruno-crm'));
+            }
+            $labels = self::variation_labels($product);
+            $prev = [];
+            foreach ($f as $k => $_) { if (array_key_exists($k, $cur)) $prev[$k] = $cur[$k]; }
+            if ($attrs !== null) {
+                $old = [];
+                foreach ((array) $v->get_attributes('edit') as $k => $val) $old[isset($labels[$k]) ? $labels[$k] : (string) $k] = (string) $val;
+                $prev['attributes'] = $old;
+                $v->set_attributes($attrs);
+            }
+            if ($en !== null) {
+                $prev['enabled'] = ($vp->post_status === 'publish');
+                $v->set_status($en ? 'publish' : 'private');
+            }
+            $res = self::product_apply($v, $f);
+            if (is_wp_error($res)) return $res;
+            self::sync_variable($p->ID);
+            $fresh = wc_get_product($p->ID);
+            return ['product_id' => (int) $p->ID, 'variation' => self::variation_row(wc_get_product($v->get_id()), self::variation_labels($fresh)), 'previous' => $prev];
+        });
+    }
+
+    public static function route_delete_variation($request) {
+        return self::respond('delete_variation', function ($q) use ($request) {
+            $loaded = self::writable_variation($request);
+            if (is_wp_error($loaded)) return $loaded;
+            list($p, $product, $v, $vp) = $loaded;
+            $data = self::json_body($request, ['expected_modified_gmt', 'confirm_delete']);
+            if (is_wp_error($data)) return $data;
+            if (!current_user_can('delete_post', $vp->ID)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not delete this variation.', 'webruno-crm'));
+            $ok = self::check_expected($vp, $data);
+            if (is_wp_error($ok)) return $ok;
+            $ok = self::require_delete_confirmation($data, __('this variation', 'webruno-crm'));
+            if (is_wp_error($ok)) return $ok;
+            $row = self::variation_row($v, self::variation_labels($product));
+            if (!$v->delete(true)) return self::err('webruno_error', 500, __('Could not delete the variation.', 'webruno-crm'));
+            self::sync_variable($p->ID);
+            return ['deleted' => true, 'product_id' => (int) $p->ID, 'variation' => $row];
+        });
+    }
+
+    public static function route_delete_product($request) {
+        return self::respond('delete_product', function ($q) use ($request) {
+            $loaded = self::writable_product($request);
+            if (is_wp_error($loaded)) return $loaded;
+            list($p, $product) = $loaded;
+            $data = self::json_body($request, ['expected_modified_gmt', 'confirm_delete']);
+            if (is_wp_error($data)) return $data;
+            if (!current_user_can('delete_post', $p->ID)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not delete this product.', 'webruno-crm'));
+            $ok = self::check_expected($p, $data);
+            if (is_wp_error($ok)) return $ok;
+            $ok = self::require_delete_confirmation($data, __('this product (and all its variations)', 'webruno-crm'));
+            if (is_wp_error($ok)) return $ok;
+            $row = ['id' => (int) $p->ID, 'name' => wp_strip_all_tags($product->get_name()), 'type' => $product->get_type(), 'status' => $p->post_status];
+            if (!$product->delete(true)) return self::err('webruno_error', 500, __('Could not delete the product.', 'webruno-crm'));
+            $all = get_option(self::OPT_PROD_SNAP, []);
+            if (is_array($all) && isset($all[$row['id']])) { unset($all[$row['id']]); update_option(self::OPT_PROD_SNAP, $all, false); }
+            return ['deleted' => true] + $row;
+        });
+    }
+
+    public static function route_delete_post($request) {
+        return self::respond('delete_post', function ($q) use ($request) {
+            $p = self::writable_post($request, 'delete_post', false);
+            if (is_wp_error($p)) return $p;
+            $data = self::json_body($request, ['expected_modified_gmt', 'confirm_delete']);
+            if (is_wp_error($data)) return $data;
+            $ok = self::check_expected($p, $data);
+            if (is_wp_error($ok)) return $ok;
+            $ok = self::require_delete_confirmation($data, __('this post or page (with its revisions and comments)', 'webruno-crm'));
+            if (is_wp_error($ok)) return $ok;
+            $row = ['id' => (int) $p->ID, 'type' => $p->post_type, 'title' => wp_strip_all_tags($p->post_title), 'status' => $p->post_status];
+            if (!wp_delete_post($p->ID, true)) return self::err('webruno_error', 500, __('Could not delete the item.', 'webruno-crm'));
+            return ['deleted' => true] + $row;
+        });
+    }
+
+    public static function route_delete_term($request) {
+        return self::respond('delete_term', function ($q) use ($request) {
+            $params = $request->get_url_params();
+            $id = isset($params['id']) ? (int) $params['id'] : 0;
+            self::$target = $id;
+            $t = $id > 0 ? get_term($id) : null;
+            if (!$t || is_wp_error($t) || !in_array($t->taxonomy, self::WRITE_TAXES, true)) return self::err('webruno_not_found', 404, __('Not found.', 'webruno-crm'));
+            $obj = self::write_taxonomy($t->taxonomy);
+            if (is_wp_error($obj)) return $obj;
+            if (!current_user_can('delete_term', $id)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not delete this term.', 'webruno-crm'));
+            $data = self::json_body($request, ['expected_version', 'confirm_delete']);
+            if (is_wp_error($data)) return $data;
+            if (!isset($data['expected_version']) || !is_string($data['expected_version']) || !preg_match('/^[0-9a-f]{40}$/', $data['expected_version'])) {
+                return self::err('webruno_bad_request', 400, __('expected_version (the version you got when you last read this term) is required.', 'webruno-crm'));
+            }
+            if ($data['expected_version'] !== self::term_version($t)) return self::err('webruno_conflict', 409, __('This term was changed on the site after you read it. Read it again before deleting.', 'webruno-crm'));
+            $default = ($t->taxonomy === 'category' && (int) get_option('default_category') === $id) || ($t->taxonomy === 'product_cat' && (int) get_option('default_product_cat') === $id);
+            if ($default) return self::err('webruno_conflict', 409, __('This is the default category of the site and cannot be deleted.', 'webruno-crm'));
+            /* translators: %d: number of items */
+            $what = sprintf(__('this category or tag (it is used by %d items, which will lose it)', 'webruno-crm'), (int) $t->count);
+            $ok = self::require_delete_confirmation($data, $what);
+            if (is_wp_error($ok)) return $ok;
+            $row = self::term_row($t);
+            $res = wp_delete_term($id, $t->taxonomy);
+            if (is_wp_error($res) || !$res) return self::err('webruno_error', 500, __('Could not delete the term.', 'webruno-crm'));
+            return ['deleted' => true, 'term' => $row];
+        });
+    }
+
+    public static function route_delete_menu($request) {
+        return self::respond('delete_menu', function ($q) use ($request) {
+            $menu = self::loaded_menu($request);
+            if (is_wp_error($menu)) return $menu;
+            $data = self::json_body($request, ['expected_items_hash', 'confirm_delete']);
+            if (is_wp_error($data)) return $data;
+            $cur = self::menu_items_of((int) $menu->term_id);
+            if (!isset($data['expected_items_hash']) || !is_string($data['expected_items_hash']) || !preg_match('/^[0-9a-f]{40}$/', $data['expected_items_hash'])) {
+                return self::err('webruno_bad_request', 400, __('expected_items_hash (the items_hash you got when you last read this menu) is required.', 'webruno-crm'));
+            }
+            if ($data['expected_items_hash'] !== self::menu_hash($cur)) return self::err('webruno_conflict', 409, __('This menu was changed on the site after you read it. Read it again before deleting.', 'webruno-crm'));
+            $ok = self::require_delete_confirmation($data, __('this menu and all its items', 'webruno-crm'));
+            if (is_wp_error($ok)) return $ok;
+            $res = wp_delete_nav_menu((int) $menu->term_id);
+            if (is_wp_error($res) || !$res) return self::err('webruno_error', 500, __('Could not delete the menu.', 'webruno-crm'));
+            return ['deleted' => true, 'id' => (int) $menu->term_id, 'name' => $menu->name, 'previous_items' => $cur];
         });
     }
 
@@ -1240,7 +2136,7 @@ class Webruno_Content_API {
                             <input type="checkbox" name="webruno_content_write" value="1" <?php checked(self::write_enabled()); ?> <?php disabled(!$has_key); ?> />
                             <?php esc_html_e('Allow Webruno to edit content', 'webruno-crm'); ?>
                         </label>
-                        <p class="description"><?php esc_html_e('Webruno (and AI assistants you connect) can then create drafts and edit the title, text, excerpt and address of posts and pages, publish them or move them to the trash. They can also change your navigation menus, and the header, footer and navigation of a block theme. Nothing else on your site can be changed. Before every edit of a post, page, header, footer or block navigation a revision of the current version is saved so you can undo it (Revisions). Before a menu is changed its previous state is kept so Webruno can put it back. Scripts are always removed from what is written. Needs "Read content" to be on.', 'webruno-crm'); ?></p>
+                        <p class="description"><?php esc_html_e('Webruno (and AI assistants you connect) can then create drafts and edit the title, text, excerpt and address of posts and pages, publish them or move them to the trash. They can create and edit simple and variable WooCommerce products with their variations, and categories and tags. They can also change your navigation menus, and the header, footer and navigation of a block theme. Permanent deletion of posts, pages, products, variations, categories and menus is possible only when the assistant has asked you in the chat and you confirmed it. Nothing else on your site can be changed. Before every edit of a post, page, header, footer or block navigation a revision of the current version is saved so you can undo it (Revisions). Before a menu is changed its previous state is kept so Webruno can put it back. Scripts are always removed from what is written. Needs "Read content" to be on.', 'webruno-crm'); ?></p>
                     </td>
                 </tr>
             </table>
