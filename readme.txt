@@ -30,6 +30,17 @@ All sync sources are optional and off by default except leads and orders, and ev
 3. Approve the connection on Webruno.
 4. Configure what to sync under Webruno CRM > Sync Settings.
 
+== Connect to an AI assistant (MCP) ==
+
+After connecting, open Webruno CRM > Connect to AI. That page shows your MCP address (https://panel.webruno.com/customer/mcpCustomer, or panel.webruno.ir for the Iran server) and step-by-step instructions.
+
+1. In Sync Settings, turn on "Reading content". Turn on "Editing posts and pages" only if you want the AI to create or edit content (both are off by default).
+2. In Claude: Settings > Connectors > Add custom connector, paste the MCP address, then Connect and sign in to Webruno.
+3. In ChatGPT: Settings > Connectors > enable Developer mode, create a connector with the MCP address and OAuth.
+4. In Claude Code: run `claude mcp add --transport http webruno <address>`, then /mcp > Authenticate.
+5. In Cursor: add {"mcpServers":{"webruno":{"url":"<address>"}}} to .cursor/mcp.json.
+6. Ask your AI: "List my Webruno websites".
+
 == Frequently Asked Questions ==
 
 = Do I need a Webruno account? =

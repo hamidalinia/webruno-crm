@@ -110,6 +110,7 @@ class Webruno_Auth {
         return self::decrypt($encrypted);
     }
 
+    // phpcs:disable WordPress.Security.NonceVerification.Missing -- every AJAX handler below calls self::guard() first, which runs check_ajax_referer().
     /** Shared permission + nonce check for all AJAX handlers. */
     private static function guard() {
         check_ajax_referer('webruno_crm_ajax', 'nonce');
@@ -276,7 +277,7 @@ class Webruno_Auth {
         }
 
         if ($domain === 'custom') {
-            $raw    = isset($_POST['custom_domain']) ? trim((string) wp_unslash($_POST['custom_domain'])) : '';
+            $raw    = isset($_POST['custom_domain']) ? trim((string) wp_unslash($_POST['custom_domain'])) : ''; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- validated by sanitize_custom_domain() (https URL only)
             $custom = self::sanitize_custom_domain($raw);
             if (!$custom) {
                 wp_send_json_error(['message' => __('Please enter a custom domain URL that starts with https://', 'webruno-crm')]);

@@ -85,7 +85,7 @@ class Webruno_Content_API {
 
     public static function prune() {
         global $wpdb;
-        $wpdb->query($wpdb->prepare('DELETE FROM ' . self::table_nonces() . ' WHERE created < %d', time() - self::NONCE_KEEP));
+        $wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->prefix}webruno_nonces WHERE created < %d", time() - self::NONCE_KEEP)); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- custom table, must not be cached
     }
 
     /** Called by Webruno_Auth after the panel approved the connection. Consent is per connection: both switches start OFF. */
@@ -123,13 +123,13 @@ class Webruno_Content_API {
     private static function audit($op, $route, $target, $result, $code, $http) {
         global $wpdb;
         $prev = $wpdb->suppress_errors(true);
-        $ok = $wpdb->insert(self::table_audit(), [
+        $ok = $wpdb->insert(self::table_audit(), [ // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- custom table
             'ts' => time(), 'op' => substr((string) $op, 0, 40), 'route' => substr((string) $route, 0, 120),
             'target_id' => (int) $target, 'result' => substr((string) $result, 0, 20),
             'code' => substr((string) $code, 0, 60), 'http' => (int) $http,
         ], ['%d', '%s', '%s', '%d', '%s', '%s', '%d']);
         if ($ok && $wpdb->insert_id > self::AUDIT_CAP) {
-            $wpdb->query($wpdb->prepare('DELETE FROM ' . self::table_audit() . ' WHERE id <= %d', $wpdb->insert_id - self::AUDIT_CAP));
+            $wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->prefix}webruno_audit WHERE id <= %d", $wpdb->insert_id - self::AUDIT_CAP)); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- custom table, must not be cached
         }
         $wpdb->suppress_errors($prev);
     }
@@ -153,7 +153,7 @@ class Webruno_Content_API {
     public static function recent_audit($limit = 20) {
         global $wpdb;
         $prev = $wpdb->suppress_errors(true);
-        $rows = $wpdb->get_results($wpdb->prepare('SELECT ts, op, route, target_id, result, code, http FROM ' . self::table_audit() . ' ORDER BY id DESC LIMIT %d', (int) $limit), ARRAY_A);
+        $rows = $wpdb->get_results($wpdb->prepare("SELECT ts, op, route, target_id, result, code, http FROM {$wpdb->prefix}webruno_audit ORDER BY id DESC LIMIT %d", (int) $limit), ARRAY_A); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- custom table, must not be cached
         $wpdb->suppress_errors($prev);
         return is_array($rows) ? $rows : [];
     }
@@ -240,7 +240,7 @@ class Webruno_Content_API {
     private static function reserve_nonce($site, $nonce) {
         global $wpdb;
         $prev = $wpdb->suppress_errors(true);
-        $res = $wpdb->query($wpdb->prepare('INSERT INTO ' . self::table_nonces() . ' (nonce_hash, created) VALUES (%s, %d)', hash('sha256', $site . "\n" . $nonce), time()));
+        $res = $wpdb->query($wpdb->prepare("INSERT INTO {$wpdb->prefix}webruno_nonces (nonce_hash, created) VALUES (%s, %d)", hash('sha256', $site . "\n" . $nonce), time())); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- custom table, must not be cached
         $wpdb->suppress_errors($prev);
         return $res === 1;
     }
@@ -251,7 +251,7 @@ class Webruno_Content_API {
         $limit = (int) apply_filters('webruno_crm_content_rate_limit', 60);
         if ($limit <= 0) return false;
         $prev = $wpdb->suppress_errors(true);
-        $n = $wpdb->get_var($wpdb->prepare('SELECT COUNT(*) FROM ' . self::table_audit() . ' WHERE ts >= %d AND result <> %s', time() - 60, 'rejected'));
+        $n = $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->prefix}webruno_audit WHERE ts >= %d AND result <> %s", time() - 60, 'rejected')); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- custom table, must not be cached
         $wpdb->suppress_errors($prev);
         return (int) $n >= $limit;
     }
