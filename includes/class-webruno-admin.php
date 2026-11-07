@@ -52,6 +52,7 @@ class Webruno_Admin {
             'nonce'   => wp_create_nonce('webruno_crm_ajax'),
             'strings' => [
                 'connecting'        => __('Connecting…', 'webruno-crm'),
+                'regionChecking'    => __('Checking which Webruno server fits this site…', 'webruno-crm'),
                 'waiting'           => __('Waiting for your approval on Webruno… Sign in there and approve this site.', 'webruno-crm'),
                 'openLink'          => __('Open the Webruno approval page', 'webruno-crm'),
                 'cancel'            => __('Cancel', 'webruno-crm'),
@@ -110,19 +111,28 @@ class Webruno_Admin {
             <p><strong><?php esc_html_e('Connect to get this on autopilot:', 'webruno-crm'); ?></strong>
                 <?php esc_html_e('automatic follow-ups, repeat-buyer tags, and cold-lead reminders — without leaving wp-admin.', 'webruno-crm'); ?></p>
 
+            <?php $region_state = Webruno_Region::get_state(); ?>
             <p>
-                <button type="button" class="button button-primary button-hero webruno-crm-connect-btn" data-domain="webruno.com">
+                <button type="button" class="button button-primary button-hero webruno-crm-connect-btn" id="webruno-crm-connect-main" data-domain="<?php echo esc_attr($region_state['domain']); ?>">
                     <?php esc_html_e('Connect & Create Free Webruno Account', 'webruno-crm'); ?>
                 </button>
             </p>
             <p class="description"><?php esc_html_e('Free to connect. No credit card required. A Webruno page opens in a new tab where you sign in (or sign up) and approve this site.', 'webruno-crm'); ?></p>
 
-            <p style="margin-top:8px;">
-                <?php esc_html_e('Prefer webruno.ir?', 'webruno-crm'); ?>
-                <button type="button" class="button-link webruno-crm-connect-btn" data-domain="webruno.ir">
-                    <?php esc_html_e('Connect via webruno.ir instead', 'webruno-crm'); ?>
-                </button>
-            </p>
+            <div id="webruno-crm-region" style="margin-top:12px;padding:10px 12px;background:#f6f7f7;border:1px solid #dcdcde;border-radius:4px;">
+                <p style="margin:0 0 4px;">
+                    <?php esc_html_e('Webruno server for this site:', 'webruno-crm'); ?>
+                    <strong id="webruno-crm-region-host"><?php echo esc_html(wp_parse_url($region_state['base'], PHP_URL_HOST)); ?></strong>
+                </p>
+                <p class="description" id="webruno-crm-region-reasons" style="margin:0 0 6px;"><?php echo esc_html(implode(' ', Webruno_Region::describe_reasons($region_state['reasons']))); ?></p>
+                <p class="description" id="webruno-crm-region-message" style="margin:0 0 6px;color:#b32d2e;"><?php echo esc_html($region_state['message']); ?></p>
+                <p style="margin:0;">
+                    <?php esc_html_e('Change manually:', 'webruno-crm'); ?>
+                    <button type="button" class="button-link webruno-crm-region-set" data-region="ir"><?php esc_html_e('Iran (webruno.ir)', 'webruno-crm'); ?></button> |
+                    <button type="button" class="button-link webruno-crm-region-set" data-region="intl"><?php esc_html_e('International (webruno.com)', 'webruno-crm'); ?></button> |
+                    <button type="button" class="button-link webruno-crm-region-set" data-region="auto"><?php esc_html_e('Detect automatically', 'webruno-crm'); ?></button>
+                </p>
+            </div>
 
             <hr style="margin:20px 0;" />
 

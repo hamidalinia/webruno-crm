@@ -20,6 +20,7 @@ define('WEBRUNO_CRM_DIR', plugin_dir_path(__FILE__));
 define('WEBRUNO_CRM_URL', plugin_dir_url(__FILE__));
 define('WEBRUNO_CRM_DEFAULT_DOMAIN', 'webruno.com'); // fallback if nothing is configured yet
 
+require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-region.php';
 require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-auth.php';
 require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-dashboard.php';
 require_once WEBRUNO_CRM_DIR . 'includes/class-webruno-customer-meta.php';

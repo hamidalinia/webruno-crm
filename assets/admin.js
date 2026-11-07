@@ -185,6 +185,29 @@
             } );
     }
 
+    /* ==================== Region (which Webruno server) ==================== */
+
+    function renderRegion( data ) {
+        var main = qs( '#webruno-crm-connect-main' );
+        var host = qs( '#webruno-crm-region-host' );
+        var reasons = qs( '#webruno-crm-region-reasons' );
+        var message = qs( '#webruno-crm-region-message' );
+        if ( main && data.domain ) { main.dataset.domain = data.domain; }
+        if ( host ) { host.textContent = data.host || ''; }
+        if ( reasons ) { reasons.textContent = ( data.reasons || [] ).join( ' ' ); }
+        if ( message ) { message.textContent = data.message || ''; }
+    }
+
+    function regionRequest( action, params ) {
+        var reasons = qs( '#webruno-crm-region-reasons' );
+        if ( reasons ) { reasons.textContent = window.webrunoCrmAjax.strings.regionChecking; }
+        return ajaxPost( action, params || {} ).then( function ( result ) {
+            if ( result.json && result.json.success && result.json.data ) {
+                renderRegion( result.json.data );
+            }
+        } ).catch( function () { /* keep what is shown; connecting still reports unreachable servers */ } );
+    }
+
     function handleManualConnectSubmit( e ) {
         var form = e.currentTarget;
         var button = qs( 'button[type="submit"]', form );
@@ -331,6 +354,17 @@
         document.querySelectorAll( '.webruno-crm-connect-btn' ).forEach( function ( btn ) {
             btn.addEventListener( 'click', handleConnectClick );
         } );
+
+        // Region box (connect screen only): refresh the detection once, and handle manual changes
+        if ( qs( '#webruno-crm-region' ) ) {
+            regionRequest( 'webruno_crm_region_detect' );
+            document.querySelectorAll( '.webruno-crm-region-set' ).forEach( function ( btn ) {
+                btn.addEventListener( 'click', function ( ev ) {
+                    ev.preventDefault();
+                    regionRequest( 'webruno_crm_region_set', { region: btn.dataset.region } );
+                } );
+            } );
+        }
 
         var manualForm = qs( '#webruno-crm-manual-connect-form' );
         if ( manualForm ) {

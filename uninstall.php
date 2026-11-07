@@ -11,3 +11,5 @@ delete_option('webruno_crm_sync_orders');
 delete_option('webruno_crm_sync_posts');
 delete_option('webruno_crm_sync_leads');
 delete_option('webruno_crm_sync_users');
+delete_option('webruno_crm_region');
+delete_option('webruno_crm_region_reasons');
