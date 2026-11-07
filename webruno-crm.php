@@ -3,7 +3,7 @@
  * Plugin Name: Webruno CRM
  * Plugin URI: https://webruno.com
  * Description: Connect your site to Webruno CRM — sync orders, leads, posts, and users, and manage your CRM panel right inside wp-admin.
- * Version: 1.0.4
+ * Version: 1.1.0
  * Author: Hamid Alinia - idehweb
  * Author URI: https://idehweb.com
  * Text Domain: webruno-crm
@@ -15,7 +15,7 @@
 
 if (!defined('ABSPATH')) exit;
 
-define('WEBRUNO_CRM_VERSION', '1.0.4');
+define('WEBRUNO_CRM_VERSION', '1.1.0');
 define('WEBRUNO_CRM_DIR', plugin_dir_path(__FILE__));
 define('WEBRUNO_CRM_URL', plugin_dir_url(__FILE__));
 define('WEBRUNO_CRM_DEFAULT_DOMAIN', 'webruno.com'); // fallback if nothing is configured yet
