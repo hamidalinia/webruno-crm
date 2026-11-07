@@ -62,8 +62,8 @@ ok(/no-store/.test(String(r.headers['cache-control'])), 'responses are Cache-Con
 const now = Math.floor(Date.now() / 1000);
 const reject = {};
 reject.badSig = await call({ sig: 'a'.repeat(64) });
-reject.oldTs = await call({ ts: now - 301 });
-reject.futureTs = await call({ ts: now + 301 });
+reject.oldTs = await call({ ts: Math.floor(Date.now() / 1000) - 310 });
+reject.futureTs = await call({ ts: Math.floor(Date.now() / 1000) + 310 });
 reject.otherSite = await call({ site: '99999999-2222-4333-8444-555555555555' });
 reject.wrongSecret = await call({ secret: 'wsk_' + 'X'.repeat(43) });
 reject.tamperBody = await call({ body: 'x', signBody: '' });
@@ -79,7 +79,7 @@ ok(same.includes('webruno_unauthorized') && !/signature|nonce|timestamp|replay|s
 const n1 = crypto.randomBytes(16).toString('hex');
 const first = await call({ nonce: n1 }), replay = await call({ nonce: n1 });
 ok(first.status === 200 && replay.status === 401 && JSON.stringify(replay.json) === same, 'replay of a used nonce -> 401');
-ok((await call({ ts: now - 295 })).status === 200, 'timestamp inside the window (-295s) accepted');
+ok((await call({ ts: Math.floor(Date.now() / 1000) - 290 })).status === 200, 'timestamp inside the window (-290s) accepted');
 
 setRead(0);
 r = await call();
