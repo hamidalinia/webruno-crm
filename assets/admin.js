@@ -70,20 +70,108 @@
 
     /* ==================== Connect / Disconnect ==================== */
 
+    var pollTimer = null;
+    var pollDeadline = 0;
+
+    function stopPolling() {
+        if ( pollTimer ) {
+            clearTimeout( pollTimer );
+            pollTimer = null;
+        }
+    }
+
+    /** Clears the "waiting" UI (link + cancel button) and re-enables the connect buttons. */
+    function resetConnectUi() {
+        stopPolling();
+        var wait = qs( '#webruno-crm-waiting' );
+        if ( wait ) wait.remove();
+        document.querySelectorAll( '.webruno-crm-connect-btn' ).forEach( function ( b ) {
+            setBusy( b, false );
+        } );
+    }
+
+    function showWaiting( status, connectUrl ) {
+        var strings = window.webrunoCrmAjax.strings;
+        var wait = qs( '#webruno-crm-waiting' );
+        if ( wait ) wait.remove();
+
+        wait = document.createElement( 'p' );
+        wait.id = 'webruno-crm-waiting';
+
+        var link = document.createElement( 'a' );
+        link.href = connectUrl;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.textContent = strings.openLink;
+        wait.appendChild( link );
+
+        var cancel = document.createElement( 'button' );
+        cancel.type = 'button';
+        cancel.className = 'button-link';
+        cancel.style.marginLeft = '12px';
+        cancel.textContent = strings.cancel;
+        cancel.addEventListener( 'click', function () {
+            resetConnectUi();
+            ajaxPost( 'webruno_crm_connect_cancel', {} ).catch( function () {} );
+            setStatus( status, 'error', strings.cancelled );
+        } );
+        wait.appendChild( cancel );
+
+        status.insertAdjacentElement( 'afterend', wait );
+    }
+
+    function pollConnect( status ) {
+        var cfg = window.webrunoCrmAjax;
+
+        if ( Date.now() > pollDeadline ) {
+            resetConnectUi();
+            ajaxPost( 'webruno_crm_connect_cancel', {} ).catch( function () {} );
+            setStatus( status, 'error', cfg.strings.timedOut );
+            return;
+        }
+
+        ajaxPost( 'webruno_crm_connect_poll', {} )
+            .then( function ( result ) {
+                var data = ( result.json && result.json.data ) || {};
+                var state = data.status || 'pending';
+
+                if ( state === 'approved' ) {
+                    stopPolling();
+                    setStatus( status, 'success', data.message || '' );
+                    window.location.reload();
+                } else if ( state === 'declined' || state === 'expired' ) {
+                    resetConnectUi();
+                    setStatus( status, 'error', data.message || ( state === 'declined' ? cfg.strings.declined : cfg.strings.timedOut ) );
+                } else {
+                    pollTimer = setTimeout( function () { pollConnect( status ); }, cfg.pollIntervalMs || 3000 );
+                }
+            } )
+            .catch( function () {
+                // transient network error: keep waiting until the deadline
+                pollTimer = setTimeout( function () { pollConnect( status ); }, cfg.pollIntervalMs || 3000 );
+            } );
+    }
+
     function handleConnectClick( e ) {
         var button = e.currentTarget;
         var domain = button.dataset.domain || 'webruno.com';
         var status = qs( '#webruno-crm-status' );
 
         e.preventDefault();
+        resetConnectUi();
         setBusy( button, true, window.webrunoCrmAjax.strings.connecting );
         setStatus( status, 'pending', window.webrunoCrmAjax.strings.connecting );
 
         ajaxPost( 'webruno_crm_connect', { domain: domain } )
             .then( function ( result ) {
-                if ( result.json && result.json.success ) {
-                    setStatus( status, 'success', result.json.data.message );
-                    window.location.reload();
+                if ( result.json && result.json.success && result.json.data.connect_url ) {
+                    var url = result.json.data.connect_url;
+                    setStatus( status, 'pending', window.webrunoCrmAjax.strings.waiting );
+                    showWaiting( status, url );
+                    // may be blocked by the browser; the visible link above is the fallback
+                    window.open( url, '_blank', 'noopener,noreferrer' );
+                    pollDeadline = Date.now() + ( window.webrunoCrmAjax.pollTimeoutMs || 600000 );
+                    pollTimer = setTimeout( function () { pollConnect( status ); }, window.webrunoCrmAjax.pollIntervalMs || 3000 );
                 } else {
                     var msg = ( result.json && result.json.data && result.json.data.message )
                         || window.webrunoCrmAjax.strings.genericError;
