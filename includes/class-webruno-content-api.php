@@ -13,7 +13,8 @@
  *   ROUTE  = WordPress REST route without /wp-json (e.g. /webruno/v1/content/posts), from $request->get_route()
  *   QUERY  = query params except rest_route; keys sorted bytewise; rawurlencode(k)=rawurlencode(v); joined by "&"
  *
- * F6a registers GET routes only. There is no write route in this version.
+ * F6a: GET routes (read). F6b: POST routes for posts and pages only (create as draft, update, status, restore a revision),
+ * available only when the site admin switched "edit" on. No media upload, no WooCommerce changes, no meta, no authors, no hard delete.
  */
 if (!defined('ABSPATH')) exit;
 
@@ -31,7 +32,7 @@ class Webruno_Content_API {
     const WINDOW       = 300;   // seconds, +/-
     const NONCE_KEEP   = 900;   // nonces older than 15 minutes are pruned (window is 5 minutes)
     const AUDIT_CAP    = 1000;  // rotating log
-    const WRITE_AVAILABLE = false; // F6b flips this; until then the "edit" switch is shown but cannot be turned on
+    const WRITE_AVAILABLE = true;  // F6b: posts and pages. The site admin's "edit" switch (default OFF) still has to be on.
 
     private static $ctx    = null;
     private static $route  = '';
@@ -115,6 +116,7 @@ class Webruno_Content_API {
 
     public static function has_key()      { return self::get_secret() !== ''; }
     public static function read_enabled() { return get_option(self::OPT_READ, '0') === '1'; }
+    public static function write_enabled() { return self::WRITE_AVAILABLE && self::read_enabled() && get_option(self::OPT_WRITE, '0') === '1'; }
 
     /* ───────────────────────── audit log ───────────────────────── */
 
@@ -161,7 +163,7 @@ class Webruno_Content_API {
     /** Returns ['query' => [...]] on success or ['reason' => '...'] (internal reason, never sent to the caller). */
     private static function authenticate($request) {
         $method = strtoupper((string) $request->get_method());
-        if ($method !== 'GET') return ['reason' => 'method'];
+        if ($method !== 'GET' && $method !== 'POST') return ['reason' => 'method'];
 
         $secret  = self::get_secret();
         $site_id = (string) get_option('webruno_crm_site_id', '');
@@ -259,7 +261,12 @@ class Webruno_Content_API {
     }
 
     /** permission_callback for every route: authenticate, rate limit, switch, user. The handler runs only after this. */
-    public static function permit($request) {
+    public static function permit($request) { return self::gate($request, false); }
+
+    /** Same as permit(), and the site admin's "edit" switch must be on too. */
+    public static function permit_write($request) { return self::gate($request, true); }
+
+    private static function gate($request, $need_write) {
         self::$ctx = null;
         self::$target = 0;
         self::$route = (string) $request->get_route();
@@ -278,6 +285,10 @@ class Webruno_Content_API {
         if (!self::read_enabled()) {
             self::log('request', 'denied', 'read_disabled', 403);
             return self::err('webruno_read_disabled', 403, __('The site admin has not allowed Webruno to read content (WordPress > Webruno CRM > Sync Settings).', 'webruno-crm'));
+        }
+        if ($need_write && !self::write_enabled()) {
+            self::log('request', 'denied', 'write_disabled', 403);
+            return self::err('webruno_write_disabled', 403, __('The site admin has not allowed Webruno to edit content (WordPress > Webruno CRM > Sync Settings).', 'webruno-crm'));
         }
         $uid  = (int) get_option(self::OPT_USER, 0);
         $user = $uid > 0 ? get_userdata($uid) : false;
@@ -325,6 +336,16 @@ class Webruno_Content_API {
                 'permission_callback' => [__CLASS__, 'permit'],
             ]);
         }
+
+        // F6b write routes. Same signature scheme; additionally need the admin's "edit" switch.
+        $w = function ($path, $method, $cb, $perm) {
+            register_rest_route(self::REST_NS, $path, ['methods' => $method, 'callback' => [__CLASS__, $cb], 'permission_callback' => [__CLASS__, $perm]]);
+        };
+        $w('/content/posts', 'POST', 'route_create_post', 'permit_write');
+        $w('/content/posts/(?P<id>\d+)', 'POST', 'route_update_post', 'permit_write');
+        $w('/content/posts/(?P<id>\d+)/status', 'POST', 'route_set_status', 'permit_write');
+        $w('/content/posts/(?P<id>\d+)/revisions', 'GET', 'route_list_revisions', 'permit');
+        $w('/content/posts/(?P<id>\d+)/revisions/(?P<rev>\d+)/restore', 'POST', 'route_restore_revision', 'permit_write');
     }
 
     /* ───────────────────────── helpers ───────────────────────── */
@@ -344,6 +365,19 @@ class Webruno_Content_API {
     private static function search_term($q) {
         if (!isset($q['search']) || $q['search'] === '') return '';
         return sanitize_text_field(mb_substr((string) $q['search'], 0, 100));
+    }
+
+    /**
+     * The "last modified" time of a post, in the ISO form that reads return and writes must send back (expected_modified_gmt).
+     * WordPress leaves post_modified_gmt at '0000-00-00 00:00:00' for a brand-new draft (its date is "floating"), so in that
+     * case it is derived from post_modified (site time). Reads and the conflict check both use this, so they always agree.
+     */
+    private static function modified_iso($p) {
+        $v = self::iso($p->post_modified_gmt);
+        if ($v) return $v;
+        $local = (string) $p->post_modified;
+        if ($local === '' || strpos($local, '0000') === 0) return null;
+        return self::iso(get_gmt_from_date($local));
     }
 
     private static function iso($mysql_gmt) {
@@ -372,7 +406,7 @@ class Webruno_Content_API {
             'title' => wp_strip_all_tags($p->post_title), 'slug' => $p->post_name,
             'excerpt' => $hidden ? '' : wp_trim_words(wp_strip_all_tags(strip_shortcodes($src)), 55),
             'password_protected' => (bool) ($p->post_password !== ''),
-            'date_gmt' => self::iso($p->post_date_gmt), 'modified_gmt' => self::iso($p->post_modified_gmt),
+            'date_gmt' => self::iso($p->post_date_gmt), 'modified_gmt' => self::modified_iso($p),
             'author' => $author ? $author->display_name : null,
             'parent' => (int) $p->post_parent,
             'permalink' => get_permalink($p),
@@ -550,7 +584,7 @@ class Webruno_Content_API {
             'stock_quantity' => $product->get_stock_quantity(),
             'categories' => $cats,
             'image_url' => $img ? wp_get_attachment_url($img) : null,
-            'modified_gmt' => self::iso($p->post_modified_gmt),
+            'modified_gmt' => self::modified_iso($p),
             'permalink' => get_permalink($p), 'edit_url' => get_edit_post_link($p->ID, 'raw'),
         ];
     }
@@ -610,6 +644,240 @@ class Webruno_Content_API {
         });
     }
 
+    /* ───────────────────────── write routes (F6b): posts and pages only ───────────────────────── */
+
+    /** Reads and validates the JSON body of a write request. Unknown fields are refused. */
+    private static function json_body($request, array $allowed) {
+        $ct = (string) $request->get_header('content-type');
+        if (stripos($ct, 'application/json') !== 0) return self::err('webruno_bad_request', 415, __('The request body must be JSON (Content-Type: application/json).', 'webruno-crm'));
+        $data = json_decode((string) $request->get_body(), true);
+        if (!is_array($data) || ($data && array_values($data) === $data)) return self::err('webruno_bad_request', 400, __('The request body must be a JSON object.', 'webruno-crm'));
+        foreach (array_keys($data) as $k) {
+            if (!in_array($k, $allowed, true)) {
+                /* translators: %s: field name */
+                return self::err('webruno_bad_request', 400, sprintf(__('Unknown field: %s', 'webruno-crm'), sanitize_key((string) $k)));
+            }
+        }
+        return $data;
+    }
+
+    private static function max_chars() {
+        // TODO(owner): confirm. Default 200000 characters of content per write (filter: webruno_crm_content_max_chars).
+        return (int) apply_filters('webruno_crm_content_max_chars', 200000);
+    }
+
+    /** Output filter for everything Webruno writes: no scripts, no iframes, even for administrators. Gutenberg block comments survive. */
+    private static function clean_content($content) {
+        // wp_kses_post() removes the tags but keeps what was inside them as visible text ("alert(1)"). Drop those elements whole first.
+        $content = preg_replace('#<(script|style|iframe|object|embed|noscript)\b[^>]*>.*?</\1\s*>#is', '', (string) $content);
+        // an unclosed opener would still leave its payload behind: remove it up to the end
+        $content = preg_replace('#<(script|style|iframe|object|embed|noscript)\b.*$#is', '', (string) $content);
+        return wp_kses_post((string) $content);
+    }
+
+    private static function block_count($content) {
+        $n = 0;
+        foreach (parse_blocks((string) $content) as $b) { if (!empty($b['blockName'])) $n++; }
+        return $n;
+    }
+
+    /** Validates title / content / excerpt / slug that are present in $data. Returns array of wp_insert_post fields or WP_Error. */
+    private static function text_fields(array $data) {
+        $out = [];
+        if (array_key_exists('title', $data)) {
+            if (!is_string($data['title']) || trim($data['title']) === '' || mb_strlen($data['title']) > 300) return self::err('webruno_bad_request', 400, __('title must be a non-empty text of at most 300 characters.', 'webruno-crm'));
+            $out['post_title'] = sanitize_text_field($data['title']);
+        }
+        if (array_key_exists('content', $data)) {
+            if (!is_string($data['content']) || mb_strlen($data['content']) > self::max_chars()) return self::err('webruno_too_large', 413, __('content must be text within the size limit.', 'webruno-crm'));
+            $out['post_content'] = self::clean_content($data['content']);
+        }
+        if (array_key_exists('excerpt', $data)) {
+            if (!is_string($data['excerpt']) || mb_strlen($data['excerpt']) > 1000) return self::err('webruno_bad_request', 400, __('excerpt must be text of at most 1000 characters.', 'webruno-crm'));
+            $out['post_excerpt'] = sanitize_textarea_field($data['excerpt']);
+        }
+        if (array_key_exists('slug', $data)) {
+            if (!is_string($data['slug']) || mb_strlen($data['slug']) > 200) return self::err('webruno_bad_request', 400, __('slug must be text of at most 200 characters.', 'webruno-crm'));
+            $out['post_name'] = sanitize_title($data['slug']);
+        }
+        return $out;
+    }
+
+    /** Optimistic concurrency: the caller must send the modified time it last read. */
+    private static function check_expected($p, array $data) {
+        $e = isset($data['expected_modified_gmt']) ? $data['expected_modified_gmt'] : null;
+        if (!is_string($e) || !preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/', $e)) {
+            return self::err('webruno_bad_request', 400, __('expected_modified_gmt (the modified_gmt you got when you last read this item) is required.', 'webruno-crm'));
+        }
+        $cur = self::modified_iso($p);
+        if ($cur !== $e) {
+            /* translators: %s: ISO date */
+            return self::err('webruno_conflict', 409, sprintf(__('This item was changed on the site after you read it (it is now modified %s). Read it again before editing.', 'webruno-crm'), (string) $cur));
+        }
+        return true;
+    }
+
+    /** Loads a post or page for writing and checks the connected user's capability. */
+    private static function writable_post($request, $cap = 'edit_post') {
+        $params = $request->get_url_params();
+        $id = isset($params['id']) ? (int) $params['id'] : 0;
+        self::$target = $id;
+        $p = $id > 0 ? get_post($id) : null;
+        if (!$p || !in_array($p->post_type, ['post', 'page'], true)) return self::err('webruno_not_found', 404, __('Not found.', 'webruno-crm'));
+        if (!current_user_can($cap, $id)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not change this item.', 'webruno-crm'));
+        return $p;
+    }
+
+    private static function live_status($p) { return in_array($p->post_status, ['publish', 'private', 'future'], true); }
+
+    private static function require_live_confirmation($p, array $data) {
+        if (self::live_status($p) && (!isset($data['confirm_live']) || $data['confirm_live'] !== true)) {
+            return self::err('webruno_confirm_live_required', 400, __('This item is live on the site. Ask the person to confirm the change, then send confirm_live: true.', 'webruno-crm'));
+        }
+        return true;
+    }
+
+    /** Saves the current state as a revision so the change can be undone. Returns the revision id or false (writes are refused then). */
+    private static function snapshot($p) {
+        if (!post_type_supports($p->post_type, 'revisions') || (int) wp_revisions_to_keep($p) === 0) return false;
+        wp_save_post_revision($p->ID);
+        $revs = wp_get_post_revisions($p->ID, ['posts_per_page' => 1, 'order' => 'DESC', 'orderby' => 'date ID', 'check_enabled' => false]);
+        $latest = $revs ? reset($revs) : null;
+        return $latest ? (int) $latest->ID : false;
+    }
+
+    private static function revisions_off_error() {
+        return self::err('webruno_revisions_disabled', 409, __('Revisions are turned off for this content on the site, so changes could not be undone. Webruno does not edit without revisions.', 'webruno-crm'));
+    }
+
+    private static function write_result($p, array $extra = []) {
+        $p = get_post($p->ID);
+        $out = self::post_summary($p);
+        $out['block_count'] = self::block_count($p->post_content);
+        return array_merge($out, $extra);
+    }
+
+    public static function route_create_post($request) {
+        return self::respond('create_post', function ($q) use ($request) {
+            $data = self::json_body($request, ['post_type', 'title', 'content', 'excerpt', 'slug', 'status']);
+            if (is_wp_error($data)) return $data;
+            if (isset($data['status'])) return self::err('webruno_bad_request', 400, __('New items are always created as drafts. Publish with the status route after the person confirmed.', 'webruno-crm'));
+            $type = isset($data['post_type']) ? $data['post_type'] : 'post';
+            if (!in_array($type, ['post', 'page'], true)) return self::err('webruno_bad_request', 400, __('post_type must be post or page.', 'webruno-crm'));
+            $pt = get_post_type_object($type);
+            if (!$pt || !current_user_can($pt->cap->create_posts)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not create this content.', 'webruno-crm'));
+            if (!isset($data['title'])) return self::err('webruno_bad_request', 400, __('title is required.', 'webruno-crm'));
+            $f = self::text_fields($data);
+            if (is_wp_error($f)) return $f;
+            $f['post_type']   = $type;
+            $f['post_status'] = 'draft';
+            $f['post_author'] = get_current_user_id();
+            $id = wp_insert_post(wp_slash($f), true);
+            if (is_wp_error($id) || !$id) return self::err('webruno_error', 500, __('Could not create the item.', 'webruno-crm'));
+            self::$target = (int) $id;
+            return self::write_result(get_post($id), ['created' => true]);
+        });
+    }
+
+    public static function route_update_post($request) {
+        return self::respond('update_post', function ($q) use ($request) {
+            $p = self::writable_post($request);
+            if (is_wp_error($p)) return $p;
+            $data = self::json_body($request, ['expected_modified_gmt', 'title', 'content', 'excerpt', 'slug', 'confirm_live']);
+            if (is_wp_error($data)) return $data;
+            if ($p->post_status === 'trash') return self::err('webruno_conflict', 409, __('This item is in the trash. Restore it first (status route).', 'webruno-crm'));
+            $ok = self::check_expected($p, $data);
+            if (is_wp_error($ok)) return $ok;
+            $ok = self::require_live_confirmation($p, $data);
+            if (is_wp_error($ok)) return $ok;
+            $f = self::text_fields($data);
+            if (is_wp_error($f)) return $f;
+            if (!$f) return self::err('webruno_bad_request', 400, __('Nothing to change: send title, content, excerpt or slug.', 'webruno-crm'));
+
+            $before = self::snapshot($p);
+            if (!$before) return self::revisions_off_error();
+            $f['ID'] = $p->ID;
+            $res = wp_update_post(wp_slash($f), true);
+            if (is_wp_error($res) || !$res) return self::err('webruno_error', 500, __('Could not update the item.', 'webruno-crm'));
+            return self::write_result($p, ['revision_before' => $before]);
+        });
+    }
+
+    public static function route_set_status($request) {
+        return self::respond('set_status', function ($q) use ($request) {
+            $p = self::writable_post($request);
+            if (is_wp_error($p)) return $p;
+            $data = self::json_body($request, ['status', 'expected_modified_gmt', 'confirm']);
+            if (is_wp_error($data)) return $data;
+            $target = isset($data['status']) ? $data['status'] : null;
+            if (!in_array($target, ['draft', 'pending', 'publish', 'trash'], true)) return self::err('webruno_bad_request', 400, __('status must be draft, pending, publish or trash.', 'webruno-crm'));
+            $ok = self::check_expected($p, $data);
+            if (is_wp_error($ok)) return $ok;
+            // Publishing, trashing, or taking a live item offline (live -> draft/pending) all change what visitors see.
+            $changes_visibility = in_array($target, ['publish', 'trash'], true) || (self::live_status($p) && $p->post_status !== $target);
+            if ($changes_visibility && (!isset($data['confirm']) || $data['confirm'] !== true)) {
+                return self::err('webruno_confirm_required', 400, __('Publishing or trashing needs the person\'s confirmation. Ask them, then send confirm: true.', 'webruno-crm'));
+            }
+            $pt = get_post_type_object($p->post_type);
+            if ($target === 'publish' && !current_user_can($pt->cap->publish_posts)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not publish this content.', 'webruno-crm'));
+            if ($target === 'trash' && !current_user_can('delete_post', $p->ID)) return self::err('webruno_forbidden', 403, __('The connected WordPress user may not trash this item.', 'webruno-crm'));
+            $prev_status = $p->post_status;
+            if ($prev_status === $target) return self::write_result($p, ['unchanged' => true]);
+
+            if ($p->post_status === 'trash') {
+                wp_untrash_post($p->ID);
+                $p = get_post($p->ID);
+            }
+            if ($target === 'trash') {
+                if (!wp_trash_post($p->ID)) return self::err('webruno_error', 500, __('Could not trash the item.', 'webruno-crm'));
+            } elseif ($p->post_status !== $target) {
+                $res = wp_update_post(['ID' => $p->ID, 'post_status' => $target], true);
+                if (is_wp_error($res) || !$res) return self::err('webruno_error', 500, __('Could not change the status.', 'webruno-crm'));
+            }
+            return self::write_result($p, ['previous_status' => $prev_status]);
+        });
+    }
+
+    public static function route_list_revisions($request) {
+        return self::respond('list_revisions', function ($q) use ($request) {
+            $p = self::writable_post($request);
+            if (is_wp_error($p)) return $p;
+            $items = [];
+            foreach (wp_get_post_revisions($p->ID, ['posts_per_page' => 20, 'order' => 'DESC', 'orderby' => 'date ID', 'check_enabled' => false]) as $r) {
+                $a = get_userdata((int) $r->post_author);
+                $items[] = [
+                    'id' => (int) $r->ID, 'date_gmt' => self::iso($r->post_date_gmt),
+                    'author' => $a ? $a->display_name : null, 'title' => wp_strip_all_tags($r->post_title),
+                    'content_chars' => mb_strlen((string) $r->post_content), 'autosave' => (bool) wp_is_post_autosave($r),
+                ];
+            }
+            return ['post_id' => (int) $p->ID, 'modified_gmt' => self::modified_iso($p), 'items' => $items];
+        });
+    }
+
+    public static function route_restore_revision($request) {
+        return self::respond('restore_revision', function ($q) use ($request) {
+            $p = self::writable_post($request);
+            if (is_wp_error($p)) return $p;
+            $params = $request->get_url_params();
+            // wp_get_post_revision() takes its first argument by reference: it must be a variable, not an expression.
+            $rev_id = isset($params['rev']) ? (int) $params['rev'] : 0;
+            $rev = wp_get_post_revision($rev_id);
+            if (!$rev || (int) $rev->post_parent !== (int) $p->ID) return self::err('webruno_not_found', 404, __('Not found.', 'webruno-crm'));
+            $data = self::json_body($request, ['expected_modified_gmt', 'confirm_live']);
+            if (is_wp_error($data)) return $data;
+            if ($p->post_status === 'trash') return self::err('webruno_conflict', 409, __('This item is in the trash. Restore it first (status route).', 'webruno-crm'));
+            $ok = self::check_expected($p, $data);
+            if (is_wp_error($ok)) return $ok;
+            $ok = self::require_live_confirmation($p, $data);
+            if (is_wp_error($ok)) return $ok;
+            $before = self::snapshot($p);
+            if (!$before) return self::revisions_off_error();
+            if (!wp_restore_post_revision($rev->ID)) return self::err('webruno_error', 500, __('Could not restore the revision.', 'webruno-crm'));
+            return self::write_result($p, ['revision_before' => $before, 'restored_revision' => (int) $rev->ID]);
+        });
+    }
+
     /* ───────────────────────── settings page section ───────────────────────── */
 
     public static function handle_save() {
@@ -621,8 +889,12 @@ class Webruno_Content_API {
                 update_option(self::OPT_READ, $read, false);
                 self::audit_admin('switch_read', 'ok', $read === '1' ? 'on' : 'off');
             }
-            // The edit switch cannot be turned on in this version (no editing feature exists yet).
-            if (!self::WRITE_AVAILABLE) update_option(self::OPT_WRITE, '0', false);
+            // Editing needs reading too: turning read off turns edit off.
+            $write = (self::WRITE_AVAILABLE && $read === '1' && isset($_POST['webruno_content_write']) && '1' === sanitize_text_field(wp_unslash($_POST['webruno_content_write']))) ? '1' : '0';
+            if ($write !== get_option(self::OPT_WRITE, '0')) {
+                update_option(self::OPT_WRITE, $write, false);
+                self::audit_admin('switch_write', 'ok', $write === '1' ? 'on' : 'off');
+            }
         }
         wp_safe_redirect(add_query_arg('webruno_content_saved', '1', admin_url('admin.php?page=webruno-crm-settings')));
         exit;
@@ -665,10 +937,10 @@ class Webruno_Content_API {
                     <th scope="row"><?php esc_html_e('Edit content', 'webruno-crm'); ?></th>
                     <td>
                         <label>
-                            <input type="checkbox" name="webruno_content_write" value="1" disabled="disabled" />
+                            <input type="checkbox" name="webruno_content_write" value="1" <?php checked(self::write_enabled()); ?> <?php disabled(!$has_key); ?> />
                             <?php esc_html_e('Allow Webruno to edit content', 'webruno-crm'); ?>
                         </label>
-                        <p class="description"><?php esc_html_e('Not available in this version: Webruno cannot change anything on your site.', 'webruno-crm'); ?></p>
+                        <p class="description"><?php esc_html_e('Webruno (and AI assistants you connect) can then create drafts and edit the title, text, excerpt and address of posts and pages, publish them or move them to the trash. Nothing else on your site can be changed. Before every edit a revision of the current version is saved so you can undo it (Edit post > Revisions). Scripts are always removed from what is written. Needs "Read content" to be on.', 'webruno-crm'); ?></p>
                     </td>
                 </tr>
             </table>

@@ -26,6 +26,7 @@ const setOpt = (k, v) => wp('option', 'update', k, String(v));
 const clearAudit = () => wpPhp('global $wpdb; $wpdb->query("DELETE FROM ".Webruno_Content_API::table_audit());');
 const useUser = (id) => setOpt('webruno_crm_content_user_id', id);
 const setRead = (v) => setOpt('webruno_crm_content_read', v);
+const setWrite = (v) => setOpt('webruno_crm_content_write', v);
 
 const bodies = [];
 function call(o = {}) {
@@ -53,10 +54,10 @@ const ids = (r) => ((r.json && r.json.items) || []).map((i) => i.id);
 for (const v of vectors.vectors) ok(sign(vectors.secret, v.method, v.route, v.query, v.timestamp, v.nonce, v.body) === v.expected_signature, 'vector (test signer): ' + v.name);
 
 // ───────── A. authentication ─────────
-useUser(1); setRead(1); clearAudit();
+useUser(1); setRead(1); setWrite(0); clearAudit();
 let r = await call();
 ok(r.status === 200 && r.json && r.json.connected_user && r.json.connected_user.id === 1, 'valid signed request -> 200 site info', JSON.stringify(r.json).slice(0, 120));
-ok(r.json && r.json.content_access && r.json.content_access.write === false, 'site info: write access reported false in F6a');
+ok(r.json && r.json.content_access && r.json.content_access.write === false, 'site info: write access reported false while the edit switch is off (default)');
 ok(/no-store/.test(String(r.headers['cache-control'])), 'responses are Cache-Control: no-store');
 
 const now = Math.floor(Date.now() / 1000);
@@ -86,16 +87,20 @@ r = await call();
 ok(r.status === 403 && r.json.code === 'webruno_read_disabled', 'switch off -> 403 webruno_read_disabled even with a valid signature', r.status + ' ' + r.text.slice(0, 80));
 setRead(1);
 
-// no write routes
+// write routes: only the four POST routes of F6b exist; everything else is GET
 const routes = JSON.parse(wpPhp('$o=[]; foreach (rest_get_server()->get_routes() as $p=>$h) { if (strpos($p,"/webruno/v1/content")===0) { $m=[]; foreach ($h as $x) $m=array_merge($m,array_keys($x["methods"])); $o[$p]=array_values(array_unique($m)); } } echo json_encode($o);') || '{}');
-ok(Object.keys(routes).length >= 7 && Object.values(routes).every((m) => m.length === 1 && m[0] === 'GET'), 'route table: every content route is GET only', JSON.stringify(routes));
+const POST_OK = new Set(['/webruno/v1/content/posts', '/webruno/v1/content/posts/(?P<id>\\d+)', '/webruno/v1/content/posts/(?P<id>\\d+)/status', '/webruno/v1/content/posts/(?P<id>\\d+)/revisions/(?P<rev>\\d+)/restore']);
+ok(Object.keys(routes).length >= 10 && Object.entries(routes).every(([p, m]) => m.every((x) => x === 'GET' || (x === 'POST' && POST_OK.has(p)))), 'route table: GET everywhere, POST only on the four post write routes', JSON.stringify(routes));
+ok([...POST_OK].every((p) => (routes[p] || []).includes('POST')), 'all four write routes are registered');
 clearAudit();
 const wr = [];
-for (const m of ['POST', 'PUT', 'PATCH', 'DELETE']) for (const rt of ['/webruno/v1/content/posts', '/webruno/v1/content/site']) wr.push(await call({ method: m, route: rt, body: m === 'DELETE' ? '' : '{"title":"x"}' }));
-ok(wr.every((x) => x.status === 404 || x.status === 405), 'POST/PUT/PATCH/DELETE on content routes -> 404/405', wr.map((x) => x.status).join(','));
-ok(wr.every((x) => !(x.json && x.json.items)), 'no write method returns content');
+for (const m of ['PUT', 'PATCH', 'DELETE']) for (const rt of ['/webruno/v1/content/posts', '/webruno/v1/content/site']) wr.push(await call({ method: m, route: rt, body: m === 'DELETE' ? '' : '{"title":"x"}' }));
+wr.push(await call({ method: 'POST', route: '/webruno/v1/content/site', body: '{"title":"x"}' }));
+ok(wr.every((x) => x.status === 404 || x.status === 405), 'PUT/PATCH/DELETE anywhere and POST on /site -> 404/405', wr.map((x) => x.status).join(','));
+const off = await call({ method: 'POST', route: '/webruno/v1/content/posts', body: '{"title":"x"}' });
+ok(off.status === 403 && off.json.code === 'webruno_write_disabled', 'signed POST while the edit switch is off -> 403 webruno_write_disabled', off.status + ' ' + off.text.slice(0, 80));
 const after = await call({ route: '/webruno/v1/content/posts' });
-ok(after.status === 200 && !titles(after).includes('x'), 'nothing was created by the write attempts');
+ok(after.status === 200 && !titles(after).includes('x'), 'nothing was created by the refused writes');
 
 // ───────── B. content as administrator ─────────
 clearAudit();
